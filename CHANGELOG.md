@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.9.17] - 2026-09-28
+
+### Bug Fixes
+
+- Treat ambiguous form painting operations as artifacts in semantic tagging
+- Keep PDF spool saves in memory without creating temporary files
+- Ignore comments and form-feed separators when parsing ToUnicode bfrange blocks
+
 ## [0.9.16] - 2026-09-18
 
 ### Bug Fixes
