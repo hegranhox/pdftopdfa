@@ -381,6 +381,63 @@ class TestSanitizeToUnicodeValues:
         assert new_mapping[2] == 0x0001
         assert new_mapping[3] == 0x0002
 
+    def test_full_identity_bfrange_is_split_at_last_byte(self):
+        """mPDF-style <0000> <FFFF> <0000> ranges become well-formed."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        new_data = bytes(font["/ToUnicode"].read_bytes())
+        assert b"<0000> <FFFF> <0000>" not in new_data
+        assert b"<2600> <26FF> <2600>" in new_data
+        assert new_data.count(b"100 beginbfrange") == 2
+        assert new_data.count(b"56 beginbfrange") == 1
+        assert parse_tounicode_cmap(new_data) == parse_tounicode_cmap(cmap)
+
+    def test_bfrange_destination_overflow_is_split_with_carry(self):
+        """Destinations crossing their last byte keep the carried value."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"1 beginbfrange\n<0010> <0020> <00F8>\nendbfrange",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        new_data = bytes(font["/ToUnicode"].read_bytes())
+        assert b"2 beginbfrange\n<0010> <0017> <00F8>\n<0018> <0020> <0100>" in (
+            new_data
+        )
+        assert parse_tounicode_cmap(new_data)[0x18] == 0x0100
+
+    def test_well_formed_bfrange_is_unchanged(self):
+        """Ranges varying only in their last byte are left untouched."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"1 beginbfrange\n<2600> <26FF> <2600>\nendbfrange",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 0
+        assert bytes(font["/ToUnicode"].read_bytes()) == cmap
+
     def test_same_font_on_multiple_pages_fixed_once(self):
         """Same indirect font on two pages is only fixed once."""
         pdf = new_pdf()

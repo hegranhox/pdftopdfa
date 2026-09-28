@@ -7,7 +7,8 @@
 PDF/A (veraPDF rule 6.2.11.7.2) forbids U+0000, U+FEFF, U+FFFE,
 and Unicode surrogate code points (U+D800–U+DFFF) in ToUnicode CMap
 mappings. This sanitizer detects and replaces these values in
-pre-existing ToUnicode streams with Private Use Area codepoints.
+pre-existing ToUnicode streams with Private Use Area codepoints. It also
+splits incrementing bfranges whose mapping ISO 32000-1 leaves undefined.
 
 For PDF/A-2u, PDF/A-3u, PDF/A-2a, and PDF/A-3a, every glyph used in
 content streams must be mappable to Unicode via the ToUnicode CMap.
@@ -51,10 +52,94 @@ _BFRANGE_ENTRY_PATTERN = re.compile(
     r"(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
 )
 _HEX_TOKEN_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>")
+_COUNTED_BFRANGE_BLOCK_PATTERN = re.compile(
+    r"\d+\s+beginbfrange\b(.*?)\bendbfrange", re.DOTALL
+)
+_CMAP_BLOCK_ENTRY_LIMIT = 100
+
+
+def _split_incrementing_bfrange(entry: re.Match[str]) -> list[str] | None:
+    """Split an incrementing bfrange so that only its last bytes vary.
+
+    Returns ``None`` when the entry is already well-formed or cannot be split
+    without changing its mapping.
+    """
+    start_hex, end_hex, destination_hex = entry.group(2, 3, 4)
+    if (
+        destination_hex is None
+        or len(start_hex) != len(end_hex)
+        or len(start_hex) % 2
+        or len(destination_hex) % 2
+    ):
+        return None
+    start = int(start_hex, 16)
+    end = int(end_hex, 16)
+    destination_start = int(destination_hex, 16)
+    if end < start:
+        return None
+    if start >> 8 == end >> 8 and (destination_start & 0xFF) + (end - start) <= 0xFF:
+        return None
+    if destination_start + (end - start) >= 1 << (4 * len(destination_hex)):
+        return None
+
+    code_width = len(start_hex)
+    destination_width = len(destination_hex)
+    segments: list[str] = []
+    code = start
+    while code <= end:
+        destination = destination_start + (code - start)
+        length = min(
+            end - code + 1,
+            0x100 - (code & 0xFF),
+            0x100 - (destination & 0xFF),
+        )
+        segments.append(
+            f"<{code:0{code_width}X}> <{code + length - 1:0{code_width}X}> "
+            f"<{destination:0{destination_width}X}>"
+        )
+        code += length
+    return segments
+
+
+def _split_overflowing_bfranges(text: str) -> str:
+    """Rewrite incrementing bfranges whose codes overflow their last byte.
+
+    ISO 32000-1, 9.10.3 leaves the mapping undefined when an incrementing
+    bfrange spans more than the last byte of its source or destination.
+    Producers such as mPDF nevertheless write ``<0000> <FFFF> <0000>``, and
+    veraPDF reports codes beyond the first 256 as unmapped (rule 6.2.11.7.2).
+    The split preserves the carrying interpretation used by
+    ``parse_tounicode_cmap_sequences``.
+    """
+
+    def split_block(block: re.Match[str]) -> str:
+        body = block.group(1)
+        if _BFRANGE_ENTRY_PATTERN.sub("", body).strip():
+            return block.group(0)
+        entries: list[str] = []
+        changed = False
+        for entry in _BFRANGE_ENTRY_PATTERN.finditer(body):
+            segments = _split_incrementing_bfrange(entry)
+            if segments is None:
+                entries.append(entry.group(0).strip())
+                continue
+            entries.extend(segments)
+            changed = True
+        if not changed:
+            return block.group(0)
+        blocks = []
+        for offset in range(0, len(entries), _CMAP_BLOCK_ENTRY_LIMIT):
+            chunk = entries[offset : offset + _CMAP_BLOCK_ENTRY_LIMIT]
+            blocks.append(
+                f"{len(chunk)} beginbfrange\n" + "\n".join(chunk) + "\nendbfrange"
+            )
+        return "\n".join(blocks)
+
+    return _COUNTED_BFRANGE_BLOCK_PATTERN.sub(split_block, text)
 
 
 def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
-    """Replace invalid destinations without rebuilding the CMap."""
+    """Split undefined bfranges and replace invalid destinations in place."""
     try:
         text = cmap_data.decode("ascii")
     except UnicodeDecodeError:
@@ -144,6 +229,7 @@ def _sanitize_tounicode_cmap(cmap_data: bytes) -> bytes:
         body = _BFRANGE_ENTRY_PATTERN.sub(sanitize_entry, match.group(2))
         return f"{match.group(1)}{body}{match.group(3)}"
 
+    text = _split_overflowing_bfranges(text)
     text = _BFCHAR_BLOCK_PATTERN.sub(sanitize_bfchar_block, text)
     text = _BFRANGE_BLOCK_PATTERN.sub(sanitize_bfrange_block, text)
     return text.encode("ascii")
@@ -154,7 +240,8 @@ def sanitize_tounicode_values(pdf: Pdf) -> dict[str, int]:
 
     Iterates all fonts and checks their ToUnicode streams for forbidden
     values. Affected destinations are replaced with PUA codepoints while
-    valid mappings remain unchanged.
+    valid mappings remain unchanged. Incrementing bfranges that overflow
+    their last byte are split into equivalent well-formed ranges.
 
     Args:
         pdf: Opened pikepdf PDF object (modified in place).
@@ -197,7 +284,7 @@ def sanitize_tounicode_values(pdf: Pdf) -> dict[str, int]:
 
             total_fixed += 1
             logger.debug(
-                "Fixed invalid Unicode values in ToUnicode for font %s",
+                "Fixed ToUnicode CMap for font %s",
                 _font_key,
             )
 
