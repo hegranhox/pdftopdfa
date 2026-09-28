@@ -4,10 +4,11 @@
 
 """Utility functions for PDF/A conversion."""
 
+import io
 import logging
 import sys
 from collections.abc import Generator
-from typing import Any
+from typing import IO, Any
 
 from pikepdf import Array, Dictionary, Pdf
 
@@ -98,6 +99,52 @@ def log_suppressed_error(
         )
     else:
         module_logger.log(level, msg, *args)
+
+
+class _SpoolWriter(io.RawIOBase):
+    """Writable view of a spool that exposes no file descriptor."""
+
+    def __init__(self, spool: IO[bytes]) -> None:
+        super().__init__()
+        self._spool = spool
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def write(self, data: Any) -> int:
+        return self._spool.write(data)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        return self._spool.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._spool.tell()
+
+    def flush(self) -> None:
+        if not self.closed:
+            self._spool.flush()
+
+
+def save_pdf_to_spool(pdf: Pdf, spool: IO[bytes], **save_options: Any) -> None:
+    """Saves a PDF into a SpooledTemporaryFile without forcing rollover.
+
+    pikepdf 10.14+ calls ``fileno()`` on save streams to detect overwriting the
+    input, and ``SpooledTemporaryFile.fileno()`` always rolls over to disk.
+    A fresh spool can never be the input, so the descriptor is hidden.
+
+    Args:
+        pdf: Opened pikepdf PDF object.
+        spool: Empty writable spool.
+        **save_options: Keyword arguments for ``pikepdf.Pdf.save``.
+    """
+    writer = _SpoolWriter(spool)
+    try:
+        pdf.save(writer, **save_options)
+    finally:
+        writer.close()
 
 
 def is_pdf_encrypted(pdf: Pdf) -> bool:

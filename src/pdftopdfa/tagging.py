@@ -36,7 +36,7 @@ from .sanitizers.optional_content import (
     _default_optional_content_visibility,
     _DefaultOCVisibility,
 )
-from .utils import resolve_indirect
+from .utils import resolve_indirect, save_pdf_to_spool
 
 if TYPE_CHECKING:
     from .digital_layout import ClipPolygon, InvocationPaintState
@@ -11515,7 +11515,7 @@ def ensure_logical_structure(
             ) as serialized:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", pikepdf.PageCopyWarning)
-                    pdf.save(serialized, encryption=preflight_encryption)
+                    save_pdf_to_spool(pdf, serialized, encryption=preflight_encryption)
                 serialized.seek(0)
                 open_options = (
                     {"password": preflight_password}

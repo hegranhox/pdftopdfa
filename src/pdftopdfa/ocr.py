@@ -66,7 +66,7 @@ from .staging import (
     rollback_staged_publication,
     staged_file_snapshot,
 )
-from .utils import log_suppressed_error
+from .utils import log_suppressed_error, save_pdf_to_spool
 
 logger = logging.getLogger(__name__)
 
@@ -2194,7 +2194,7 @@ def _validate_ocr_content_work_budget(
             max_size=_SERIALIZED_PDF_MEMORY_LIMIT,
             mode="w+b",
         ) as serialized:
-            pdf.save(serialized, compress_streams=False)
+            save_pdf_to_spool(pdf, serialized, compress_streams=False)
             serialized.seek(0)
             with pikepdf.open(serialized) as canonical_pdf:
                 if force:
