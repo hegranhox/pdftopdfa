@@ -438,6 +438,38 @@ class TestSanitizeToUnicodeValues:
         assert result["tounicode_values_fixed"] == 0
         assert bytes(font["/ToUnicode"].read_bytes()) == cmap
 
+    @pytest.mark.parametrize(
+        "block",
+        [
+            b"1 beginbfrange\n% identity\n<0000> <FFFF> <0000> % mPDF\nendbfrange",
+            b"1 beginbfrange\n<0000> <FFFF> <0000>\n% no endbfrange yet\nendbfrange",
+            b"1 beginbfrange\n% <0100> <01FF> <4100>\n<0000> <FFFF> <0000>\nendbfrange",
+        ],
+        ids=["comment-lines", "endbfrange-in-comment", "commented-out-entry"],
+    )
+    def test_bfrange_split_ignores_comments(self, block):
+        """CMap comments neither block the split nor become mappings."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            block,
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        new_data = bytes(font["/ToUnicode"].read_bytes())
+        assert b"%" not in new_data
+        assert b"<0000> <FFFF> <0000>" not in new_data
+        assert new_data.count(b"beginbfrange") == 3
+        assert new_data.count(b"endbfrange") == 3
+        mapping = parse_tounicode_cmap(new_data)
+        assert mapping[0x0100] == 0x0100
+        assert mapping[0x260F] == 0x260F
+
     def test_same_font_on_multiple_pages_fixed_once(self):
         """Same indirect font on two pages is only fixed once."""
         pdf = new_pdf()
