@@ -892,12 +892,12 @@ class TestEnsureAppearanceStreams:
             Name.bad,
             42,
             "bad",
-            Array([0, 1]),
-            Array([Name.bad]),
-            Array(["0.5"]),
-            Array([True]),
-            Array([-0.1]),
-            Array([1.1]),
+            [0, 1],
+            [Name.bad],
+            ["0.5"],
+            [True],
+            [-0.1],
+            [1.1],
         ],
     )
     def test_malformed_color_raises(self, make_pdf_with_page, subtype, key, color):
@@ -908,7 +908,8 @@ class TestEnsureAppearanceStreams:
                 Rect=Array([0, 0, 100, 100]),
             )
         )
-        annot[key] = color
+        # Build arrays per test: a shared Array would belong to the first Pdf.
+        annot[key] = Array(color) if isinstance(color, list) else color
         pdf.pages[0].Annots = Array([annot])
 
         with pytest.raises(ConversionError, match="invalid .* color array"):

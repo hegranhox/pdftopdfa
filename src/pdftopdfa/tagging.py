@@ -36,7 +36,7 @@ from .sanitizers.optional_content import (
     _default_optional_content_visibility,
     _DefaultOCVisibility,
 )
-from .utils import resolve_indirect
+from .utils import resolve_indirect, save_pdf_to_spool
 
 if TYPE_CHECKING:
     from .digital_layout import ClipPolygon, InvocationPaintState
@@ -6904,17 +6904,15 @@ def _direct_artifact_items(
                     and isinstance(owner, Stream)
                     and resolve_indirect(owner.get("/Subtype")) == Name.Form
                 )
-                ambiguous_unclassified_form_paint = (
-                    unclassified_form_paint and fill_geometry_status is None
+                # Unclassified Form paint whose geometry or final-paint visibility
+                # cannot be proven is never bound as a Figure; it becomes a Layout
+                # artifact and requests manual vector review instead.
+                ambiguous_unclassified_form_paint = unclassified_form_paint and (
+                    fill_geometry_status is None
+                    or stroke_state_uncertain
+                    or fill_state_uncertain
+                    or not clip_is_exact
                 )
-                if unclassified_form_paint and (
-                    stroke_state_uncertain or fill_state_uncertain or not clip_is_exact
-                ):
-                    raise ConversionError(
-                        f"Cannot create semantic structure: {description} has "
-                        "unclassified Form vector painting with uncertain final-paint "
-                        "visibility"
-                    )
                 if (
                     operator_name == "sh"
                     and not artifact_paint
@@ -7482,7 +7480,8 @@ def _digital_semantic_inputs(
                 ):
                     raise ConversionError(
                         f"Cannot create semantic structure: {description} has a "
-                        "described Form with ambiguous path geometry"
+                        "described Form with ambiguous path geometry or uncertain "
+                        "final-paint visibility"
                     )
                 if not nested_summary.has_semantic_paint:
                     continue
@@ -8080,7 +8079,8 @@ def _digital_semantic_inputs(
             ):
                 raise ConversionError(
                     f"Cannot create semantic structure: {form_description} is "
-                    "described but has ambiguous path geometry"
+                    "described but has ambiguous path geometry or uncertain "
+                    "final-paint visibility"
                 )
 
             if summary.bind_as_figure:
@@ -11515,7 +11515,7 @@ def ensure_logical_structure(
             ) as serialized:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", pikepdf.PageCopyWarning)
-                    pdf.save(serialized, encryption=preflight_encryption)
+                    save_pdf_to_spool(pdf, serialized, encryption=preflight_encryption)
                 serialized.seek(0)
                 open_options = (
                     {"password": preflight_password}

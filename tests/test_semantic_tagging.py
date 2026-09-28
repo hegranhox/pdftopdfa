@@ -7187,6 +7187,90 @@ def test_simple_concave_unclassified_form_fill_is_preserved() -> None:
     assert "/Figure" in _roles(pdf)
 
 
+_UNCERTAIN_FORM_VECTOR_CONTENT = [
+    b"10 10 20 20 re 30 15 20 10 re W n 10 10 40 20 re f",
+    b"0 w 10 10 m 50 10 l S",
+]
+_UNCERTAIN_FORM_VECTOR_IDS = ["union-of-rectangles-clip", "hairline-stroke"]
+
+
+@pytest.mark.parametrize(
+    "content", _UNCERTAIN_FORM_VECTOR_CONTENT, ids=_UNCERTAIN_FORM_VECTOR_IDS
+)
+def test_uncertain_unclassified_form_vector_becomes_layout_artifact(
+    content: bytes,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    form = _form(pdf, content, bbox=(0, 0, 100, 100))
+    page = _page(
+        pdf,
+        b"/Fm Do",
+        Dictionary(XObject=Dictionary(Fm=form)),
+        size=(100, 100),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["semantic_content_items"] == 0
+    assert result["semantic_vector_review_required"] == 1
+    assert "/Figure" not in _roles(pdf)
+    assert _marked_content(page) == [("/Artifact", "/Layout", None, None)]
+
+
+@pytest.mark.parametrize(
+    "content", _UNCERTAIN_FORM_VECTOR_CONTENT, ids=_UNCERTAIN_FORM_VECTOR_IDS
+)
+def test_form_text_survives_uncertain_vector_artifacting(content: bytes) -> None:
+    pdf = pikepdf.Pdf.new()
+    form = _form(
+        pdf,
+        b"BT /F1 10 Tf 10 70 Td (Semantic label) Tj ET q " + content + b" Q",
+        Dictionary(Font=Dictionary(F1=_font(pdf))),
+        bbox=(0, 0, 100, 100),
+    )
+    page = _page(
+        pdf,
+        b"/Fm Do",
+        Dictionary(XObject=Dictionary(Fm=form)),
+        size=(100, 100),
+    )
+
+    result = ensure_logical_structure(pdf, semantic=True)
+
+    assert result["semantic_content_items"] == 1
+    assert result["semantic_vector_review_required"] == 1
+    assert "/P" in _roles(pdf)
+    assert "/Figure" not in _roles(pdf)
+    paints = _marked_paint_stacks(_invoked_forms(page)[0])
+    assert "/Span" in next(stack for operator, stack in paints if operator == "Tj")
+    assert "/Artifact" in next(
+        stack for operator, stack in paints if operator in {"f", "S"}
+    )
+
+
+@pytest.mark.parametrize(
+    "content", _UNCERTAIN_FORM_VECTOR_CONTENT, ids=_UNCERTAIN_FORM_VECTOR_IDS
+)
+def test_described_uncertain_form_vector_still_fails_atomically(
+    content: bytes,
+) -> None:
+    pdf = pikepdf.Pdf.new()
+    form = _form(pdf, content, bbox=(0, 0, 100, 100))
+    page = _page(
+        pdf,
+        b"/Figure <</ActualText (Status icon)>> BDC /Fm Do EMC",
+        Dictionary(XObject=Dictionary(Fm=form)),
+        size=(100, 100),
+    )
+    original = bytes(page.obj["/Contents"].read_bytes())
+
+    with pytest.raises(ConversionError, match="described.*uncertain final-paint"):
+        ensure_logical_structure(pdf, semantic=True)
+
+    assert bytes(page.obj["/Contents"].read_bytes()) == original
+    assert "/StructTreeRoot" not in pdf.Root
+
+
 @pytest.mark.parametrize(
     ("policy", "expression", "visible"),
     [

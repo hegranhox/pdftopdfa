@@ -47,7 +47,7 @@ from pdfminer.utils import (
 )
 
 from .exceptions import ConversionError
-from .utils import resolve_indirect
+from .utils import resolve_indirect, save_pdf_to_spool
 
 __all__ = [
     "BBox",
@@ -2891,7 +2891,7 @@ def extract_digital_layout(
             max_size=_SERIALIZED_PDF_MEMORY_LIMIT,
             mode="w+b",
         ) as serialized:
-            pdf.save(serialized)
+            save_pdf_to_spool(pdf, serialized)
             serialized.seek(0)
             resource_manager = PDFResourceManager(caching=False)
             device = _ProvenanceDevice(resource_manager)
