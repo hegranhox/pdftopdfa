@@ -52,11 +52,15 @@ _BFRANGE_ENTRY_PATTERN = re.compile(
     r"(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
 )
 _HEX_TOKEN_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>")
-_CMAP_COMMENT_PATTERN = re.compile(r"%[^\r\n]*")
-# Comments are consumed whole, both before and inside a block, so that a block
-# can neither start nor end inside one. Only block matches set group 1.
+# PostScript comments run to the next CR, LF, or FF and act as whitespace.
+_CMAP_COMMENT = r"%[^\r\n\f]*+"
+_CMAP_COMMENT_PATTERN = re.compile(_CMAP_COMMENT)
+# Comments are consumed whole, before, inside, and between a block's header
+# tokens, so that a block can neither start nor end inside one. Only block
+# matches set group 1.
 _COUNTED_BFRANGE_BLOCK_PATTERN = re.compile(
-    r"%[^\r\n]*+|\d+\s+beginbfrange\b((?:%[^\r\n]*+|[^%])*?)\bendbfrange"
+    rf"{_CMAP_COMMENT}|\d+(?:\s|{_CMAP_COMMENT})+beginbfrange\b"
+    rf"((?:{_CMAP_COMMENT}|[^%])*?)\bendbfrange"
 )
 _CMAP_BLOCK_ENTRY_LIMIT = 100
 

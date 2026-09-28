@@ -444,8 +444,18 @@ class TestSanitizeToUnicodeValues:
             b"1 beginbfrange\n% identity\n<0000> <FFFF> <0000> % mPDF\nendbfrange",
             b"1 beginbfrange\n<0000> <FFFF> <0000>\n% no endbfrange yet\nendbfrange",
             b"1 beginbfrange\n% <0100> <01FF> <4100>\n<0000> <FFFF> <0000>\nendbfrange",
+            b"1 % note\nbeginbfrange\n<0000> <FFFF> <0000>\nendbfrange",
+            b"1%endbfrange\nbeginbfrange\n<0000> <FFFF> <0000>\nendbfrange",
+            b"1 beginbfrange % note\f<0000> <FFFF> <0000>\nendbfrange",
         ],
-        ids=["comment-lines", "endbfrange-in-comment", "commented-out-entry"],
+        ids=[
+            "comment-lines",
+            "endbfrange-in-comment",
+            "commented-out-entry",
+            "comment-in-header",
+            "endbfrange-in-header-comment",
+            "form-feed-ends-comment",
+        ],
     )
     def test_bfrange_split_ignores_comments(self, block):
         """CMap comments neither block the split nor become mappings."""
