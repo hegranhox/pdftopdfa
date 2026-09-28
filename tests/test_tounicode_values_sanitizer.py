@@ -470,6 +470,43 @@ class TestSanitizeToUnicodeValues:
         assert mapping[0x0100] == 0x0100
         assert mapping[0x260F] == 0x260F
 
+    def test_commented_out_bfrange_start_is_not_rewritten(self):
+        """A block header after % is inert and must not be activated."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"% 1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 0
+        assert bytes(font["/ToUnicode"].read_bytes()) == cmap
+
+    def test_bfrange_after_commented_block_start_is_split(self):
+        """A commented header does not hide the following real block."""
+        pdf = new_pdf()
+        font = _make_cidfont_with_tounicode(pdf, {1: 0x0041})
+        cmap = bytes(font["/ToUnicode"].read_bytes()).replace(
+            b"1 beginbfchar\n<0001> <0041>\nendbfchar",
+            b"% 2 beginbfrange (disabled)\n"
+            b"1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange",
+        )
+        font["/ToUnicode"].write(cmap)
+        _make_page_with_font(pdf, font)
+
+        result = sanitize_tounicode_values(pdf)
+
+        assert result["tounicode_values_fixed"] == 1
+        new_data = bytes(font["/ToUnicode"].read_bytes())
+        assert b"% 2 beginbfrange (disabled)\n100 beginbfrange\n" in new_data
+        assert b"<0000> <FFFF> <0000>" not in new_data
+        assert new_data.count(b"endbfrange") == 3
+        assert parse_tounicode_cmap(new_data)[0x260F] == 0x260F
+
     def test_same_font_on_multiple_pages_fixed_once(self):
         """Same indirect font on two pages is only fixed once."""
         pdf = new_pdf()

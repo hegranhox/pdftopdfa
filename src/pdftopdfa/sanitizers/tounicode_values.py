@@ -53,9 +53,10 @@ _BFRANGE_ENTRY_PATTERN = re.compile(
 )
 _HEX_TOKEN_PATTERN = re.compile(r"<([0-9A-Fa-f]+)>")
 _CMAP_COMMENT_PATTERN = re.compile(r"%[^\r\n]*")
-# Comments are consumed whole so that "endbfrange" inside one cannot end a block.
+# Comments are consumed whole, both before and inside a block, so that a block
+# can neither start nor end inside one. Only block matches set group 1.
 _COUNTED_BFRANGE_BLOCK_PATTERN = re.compile(
-    r"\d+\s+beginbfrange\b((?:%[^\r\n]*+|[^%])*?)\bendbfrange"
+    r"%[^\r\n]*+|\d+\s+beginbfrange\b((?:%[^\r\n]*+|[^%])*?)\bendbfrange"
 )
 _CMAP_BLOCK_ENTRY_LIMIT = 100
 
@@ -115,6 +116,8 @@ def _split_overflowing_bfranges(text: str) -> str:
     """
 
     def split_block(block: re.Match[str]) -> str:
+        if block.group(1) is None:
+            return block.group(0)
         # Comments carry no mappings and are dropped from rewritten blocks.
         body = _CMAP_COMMENT_PATTERN.sub("", block.group(1))
         if _BFRANGE_ENTRY_PATTERN.sub("", body).strip():
