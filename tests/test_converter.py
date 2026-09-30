@@ -3248,6 +3248,7 @@ class TestConvertToPdfa:
             import shutil
 
             shutil.copy(input_path, output_path)
+            kwargs["_processed_pages"].add(0)
             return output_path
 
         mock_apply_ocr.side_effect = create_ocr_output
@@ -3313,11 +3314,11 @@ class TestConvertToPdfa:
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")
-    def test_convert_runs_ocr_even_for_text_pdf(
+    def test_convert_delegates_text_page_skipping_to_apply_ocr(
         self,
         mock_is_ocr_available: MagicMock,
         mock_apply_ocr: MagicMock,
-        sample_pdf: Path,
+        pdf_with_text: Path,
         tmp_dir: Path,
     ) -> None:
         """OCR is invoked and lets ocrmypdf skip text pages per page."""
@@ -3336,7 +3337,7 @@ class TestConvertToPdfa:
         output_path = tmp_dir / "output.pdf"
 
         result = convert_to_pdfa(
-            sample_pdf,
+            pdf_with_text,
             output_path,
             ocr_languages=["de"],
             ocr_detection_model_dir=_DETECTION_MODEL_DIR,
@@ -3345,7 +3346,8 @@ class TestConvertToPdfa:
 
         assert result.success is True
         mock_apply_ocr.assert_called_once()
-        assert any("OCR performed" in w for w in result.warnings)
+        assert "OCR skipped: all pages already contain text" in result.warnings
+        assert not any("OCR performed" in w for w in result.warnings)
 
     @patch("pdftopdfa.ocr.apply_ocr")
     @patch("pdftopdfa.ocr.is_ocr_available")

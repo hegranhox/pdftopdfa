@@ -2212,6 +2212,61 @@ class TestApplyOcr:
             )
 
     @pytest.mark.parametrize("deskew", [False, True])
+    @pytest.mark.parametrize("with_scan", [False, True])
+    @pytest.mark.parametrize("pdfa", [False, True])
+    def test_conversion_reports_ocr_only_for_new_text_layers(
+        self,
+        tmp_dir: Path,
+        model_dirs: tuple[Path, Path],
+        validate_models: MagicMock,
+        deskew: bool,
+        with_scan: bool,
+        pdfa: bool,
+    ) -> None:
+        from pdftopdfa.converter import convert_to_pdfa
+
+        input_path = tmp_dir / "digital.pdf"
+        output_path = tmp_dir / "output.pdf"
+        with Pdf.new() as pdf:
+            _add_content_page(pdf, image_scale=50, visible_text=True)
+            _add_ocr_form(pdf, 0, "/OCR-existing", [])
+            if with_scan:
+                _add_content_page(pdf)
+            pdf.save(input_path)
+
+        def create_ocr_output(
+            source: Path, destination: Path, **kwargs: object
+        ) -> None:
+            assert kwargs["pages"] == "2"
+            with Pdf.open(source) as pdf:
+                _add_ocr_form(pdf, 1, "/OCR-recognized", [])
+                pdf.save(destination)
+
+        with patch(
+            "pdftopdfa.ocr.ocrmypdf.ocr", side_effect=create_ocr_output
+        ) as mock_ocr:
+            result = convert_to_pdfa(
+                input_path,
+                output_path,
+                pdfa=pdfa,
+                ocr_languages=["de", "en"],
+                ocr_detection_model_dir=model_dirs[0],
+                ocr_recognition_model_dir=model_dirs[1],
+                ocr_deskew=deskew,
+            )
+
+        assert result.success and not result.skipped
+        ocr_warnings = [w for w in result.warnings if w.startswith("OCR ")]
+        if with_scan:
+            mock_ocr.assert_called_once()
+            assert ocr_warnings == ["OCR performed (languages: de+en)"]
+        else:
+            mock_ocr.assert_not_called()
+            assert ocr_warnings == ["OCR skipped: all pages already contain text"]
+        with Pdf.open(output_path) as pdf:
+            assert b"(Native text)" in pdf.pages[0].Contents.read_bytes()
+
+    @pytest.mark.parametrize("deskew", [False, True])
     @pytest.mark.parametrize("form_text", [False, True])
     @pytest.mark.parametrize("clipped", [False, True])
     def test_preserves_digital_text_and_vectors_over_full_page_image(
