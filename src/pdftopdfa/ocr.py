@@ -2870,6 +2870,7 @@ def apply_ocr(
     layout: bool = False,
     _annotated_pages: frozenset[int] | None = None,
     _manifest_output_path: Path | None = None,
+    _processed_pages: set[int] | None = None,
 ) -> Path | None:
     """Performs OCR on a PDF.
 
@@ -2900,6 +2901,8 @@ def apply_ocr(
         _manifest_output_path: Private Level-A integration path for an atomic,
             versioned OCR document manifest. Supplying it also enables MCID
             markers and layout-derived reading order in the OCR text Forms.
+        _processed_pages: Private output set receiving zero-based page indices
+            with new OCR text Forms after successful output publication.
 
     Returns:
         Path to the OCR-processed PDF, or None if an existing text layer could
@@ -3430,5 +3433,10 @@ def apply_ocr(
 
     if skipped:
         return None
-    logger.info("OCR completed successfully: %s", output_path)
+    if _processed_pages is not None:
+        _processed_pages.update(new_ocr_form_names)
+    if new_ocr_form_names:
+        logger.info("OCR completed successfully: %s", output_path)
+    else:
+        logger.info("OCR skipped: all pages already contain text")
     return output_path

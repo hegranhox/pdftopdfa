@@ -1935,6 +1935,7 @@ def convert_to_pdfa(
                 else:
                     preserve_annots = False
 
+            ocr_processed_pages: set[int] = set()
             ocr_output = apply_ocr(
                 ocr_source,
                 ocr_temp_file,
@@ -1948,6 +1949,7 @@ def convert_to_pdfa(
                 layout=ocr_layout,
                 _annotated_pages=annotated_pages,
                 _manifest_output_path=ocr_manifest_temp_file,
+                _processed_pages=ocr_processed_pages,
             )
             if ocr_output is None:
                 raise OCRError(
@@ -1998,8 +2000,11 @@ def convert_to_pdfa(
                     ocr_clean_temp_file = None
 
             actual_input = ocr_temp_file
-            lang_str = "+".join(effective_ocr_languages)
-            warnings.append(f"OCR performed (languages: {lang_str})")
+            if ocr_processed_pages:
+                lang_str = "+".join(effective_ocr_languages)
+                warnings.append(f"OCR performed (languages: {lang_str})")
+            else:
+                warnings.append("OCR skipped: all pages already contain text")
 
         if not pdfa:
             _copy_input_to_output(
