@@ -2,14 +2,20 @@
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-10-02
+
 ### Features
 
 - Add `prepare_table_runtime()` to load the PaddleOCR table runtime explicitly on the main thread
 
 ### Changes
 
-- Stop preloading the PaddleOCR table runtime when `pdftopdfa` or its table API is imported; the runtime is now loaded on first use, which avoids loading PaddleOCR, PaddleX, and their optional dependencies at import time in frozen Windows applications
-- Frozen Windows applications that recognize tables in worker threads must now call `prepare_table_runtime()` on the main thread of the same process before starting those workers; importing `pdftopdfa` on the main thread no longer suffices, and table calls on the main thread need no preparation
+- Load the PaddleOCR table runtime on first use to avoid importing PaddleOCR, PaddleX, and optional dependencies when importing `pdftopdfa` or its table API
+- Require frozen Windows applications with table worker threads to call `prepare_table_runtime()` on the main thread of the same process before starting workers
+
+### Bug Fixes
+
+- Report OCR as skipped when all pages already contain text
 
 ### Documentation
 
