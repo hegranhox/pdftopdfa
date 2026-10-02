@@ -12,26 +12,58 @@ import logging
 import os
 import subprocess
 import sys
+import textwrap
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
+import pdftopdfa
 import pdftopdfa.table as table
 from pdftopdfa import (
     TableBoundingBox,
     TableCell,
     TableRecognitionResult,
     TableType,
+    prepare_table_runtime,
     recognize_table,
 )
 from pdftopdfa.exceptions import OCRError
+
+_TABLE_EXPORTS = (
+    "TableBoundingBox",
+    "TableCell",
+    "TableRecognitionResult",
+    "TableType",
+    "prepare_table_runtime",
+    "recognize_table",
+)
+_FRESH_IMPORT_PRELUDE = """
+import sys
+
+attempted_paddle_imports = []
+
+
+class RecordPaddleImports:
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if name.partition(".")[0] in {"paddle", "paddleocr", "paddlex"}:
+            attempted_paddle_imports.append(name)
+        return None
+
+
+sys.meta_path.insert(0, RecordPaddleImports)
+# On Windows, this makes pdftopdfa treat the process as a frozen application.
+sys.frozen = True
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -108,12 +140,129 @@ def _fake_models(
     return classifier, pipeline
 
 
+@pytest.fixture
+def frozen_windows_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, ModuleType]:
+    """Simulate a frozen Windows process with an unloaded fake table runtime."""
+    modules = {
+        name: ModuleType(name)
+        for name in (
+            "paddleocr",
+            "paddleocr._common_args",
+            "paddlex",
+            "paddlex.inference",
+            "paddlex.inference.pipelines",
+            "paddlex.inference.pipelines.table_recognition",
+            "paddlex.inference.pipelines.table_recognition.pipeline_v2",
+        )
+    }
+    for name, module in modules.items():
+        parent, _, child = name.rpartition(".")
+        if parent:
+            setattr(modules[parent], child, module)
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(table, "_cached_runtime", None)
+    monkeypatch.setattr(table, "_is_frozen_windows", lambda: True)
+    return modules
+
+
+@contextmanager
+def _models_requiring_table_runtime() -> Iterator[None]:
+    """Replace model creation but keep its access to the table runtime."""
+    classifier, pipeline = _fake_models(
+        "wired_table",
+        _prediction(boxes=(), ocr_boxes=(), texts=(), scores=()),
+    )
+
+    def create_classifier(*_args: object) -> SimpleNamespace:
+        table._get_table_runtime()
+        return classifier
+
+    def create_pipeline(*_args: object) -> SimpleNamespace:
+        table._get_table_runtime()
+        return pipeline
+
+    with (
+        patch.object(table, "_create_table_classifier", side_effect=create_classifier),
+        patch.object(table, "_create_table_pipeline", side_effect=create_pipeline),
+    ):
+        yield
+
+
+def _run_in_fresh_interpreter(script: str) -> None:
+    """Run a script in a new interpreter that imports this pdftopdfa checkout."""
+    source_root = Path(pdftopdfa.__file__).resolve().parents[1]
+    python_path = os.pathsep.join(
+        filter(None, (str(source_root), os.environ.get("PYTHONPATH")))
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"TABLE_EXPORTS = {_TABLE_EXPORTS!r}\n"
+            + _FRESH_IMPORT_PRELUDE
+            + textwrap.dedent(script),
+        ],
+        env={**os.environ, "PYTHONPATH": python_path},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_table_api_is_exported_on_package_level() -> None:
     assert recognize_table is table.recognize_table
+    assert prepare_table_runtime is table.prepare_table_runtime
     assert TableType is table.TableType
     assert TableBoundingBox is table.TableBoundingBox
     assert TableCell is table.TableCell
     assert TableRecognitionResult is table.TableRecognitionResult
+    assert set(_TABLE_EXPORTS) <= set(pdftopdfa.__all__)
+    assert set(_TABLE_EXPORTS) <= set(dir(pdftopdfa))
+    for name in pdftopdfa.__all__:
+        assert getattr(pdftopdfa, name) is not None
+    with pytest.raises(AttributeError, match="missing_table_api"):
+        getattr(pdftopdfa, "missing_table_api")
+
+
+def test_package_import_does_not_load_table_module_or_paddle() -> None:
+    _run_in_fresh_interpreter(
+        """
+        import pdftopdfa
+
+        assert set(TABLE_EXPORTS) <= set(pdftopdfa.__all__)
+        assert set(TABLE_EXPORTS) <= set(dir(pdftopdfa))
+        assert "pdftopdfa.table" not in sys.modules
+        assert not attempted_paddle_imports, attempted_paddle_imports
+        """
+    )
+
+
+def test_table_api_import_does_not_initialize_paddle_runtime() -> None:
+    _run_in_fresh_interpreter(
+        """
+        from pdftopdfa import (
+            TableBoundingBox,
+            TableCell,
+            TableRecognitionResult,
+            TableType,
+            prepare_table_runtime,
+            recognize_table,
+        )
+
+        import pdftopdfa
+        import pdftopdfa.table as table
+
+        assert table._cached_runtime is None
+        assert not attempted_paddle_imports, attempted_paddle_imports
+        for name in TABLE_EXPORTS:
+            assert vars(pdftopdfa)[name] is getattr(table, name)
+        """
+    )
 
 
 @pytest.mark.parametrize(
@@ -365,15 +514,86 @@ def test_classifier_constructor_is_local_onnx_only(
     )
 
 
-def test_frozen_windows_runtime_rejects_first_initialization_in_worker() -> None:
+@pytest.mark.usefixtures("frozen_windows_runtime")
+def test_frozen_windows_worker_cannot_initialize_table_runtime_first(
+    model_dirs: dict[str, Path],
+) -> None:
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            recognize_table,
+            Image.new("RGB", (2, 2), "white"),
+            **model_dirs,
+        )
+        with pytest.raises(
+            OCRError,
+            match=r"call pdftopdfa\.prepare_table_runtime\(\) on the main thread",
+        ):
+            future.result()
+
+    assert table._cached_runtime is None
+
+
+def test_prepare_table_runtime_loads_once_for_frozen_windows_workers(
+    model_dirs: dict[str, Path],
+    frozen_windows_runtime: dict[str, ModuleType],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepare_table_runtime()
+    runtime = table._cached_runtime
+    assert runtime == table._TableRuntime(
+        paddleocr=frozen_windows_runtime["paddleocr"],
+        common_args=frozen_windows_runtime["paddleocr._common_args"],
+        paddlex_table=frozen_windows_runtime[
+            "paddlex.inference.pipelines.table_recognition.pipeline_v2"
+        ],
+    )
+
+    # Importing PaddleOCR again would now fail, so later calls must reuse the
+    # prepared runtime.
+    monkeypatch.setitem(sys.modules, "paddleocr", None)
+    prepare_table_runtime()
+    assert table._cached_runtime is runtime
+
+    image = Image.new("RGB", (2, 2), "white")
     with (
-        patch.object(table, "_cached_runtime", None),
-        patch.object(table, "_is_frozen_windows", return_value=True),
+        _models_requiring_table_runtime(),
         ThreadPoolExecutor(max_workers=1) as executor,
     ):
-        future = executor.submit(table._get_table_runtime)
-        with pytest.raises(OCRError, match="imported on the main thread"):
-            future.result()
+        results = [
+            executor.submit(
+                recognize_table,
+                image,
+                ocr_execution_provider=provider,
+                **model_dirs,
+            ).result()
+            for provider in ("cpu", "directml")
+        ]
+
+    assert [result.table_type for result in results] == [TableType.WIRED] * 2
+    assert table._cached_runtime is runtime
+
+
+def test_prepare_table_runtime_reports_load_failure_as_ocr_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(table, "_cached_runtime", None)
+    monkeypatch.setitem(sys.modules, "paddleocr", None)
+
+    with pytest.raises(OCRError, match="Could not load the PaddleOCR table runtime"):
+        prepare_table_runtime()
+
+    assert table._cached_runtime is None
+
+
+@pytest.mark.usefixtures("frozen_windows_runtime")
+def test_frozen_windows_main_thread_table_call_needs_no_preparation(
+    model_dirs: dict[str, Path],
+) -> None:
+    with _models_requiring_table_runtime():
+        result = recognize_table(Image.new("RGB", (2, 2), "white"), **model_dirs)
+
+    assert result.table_type is TableType.WIRED
+    assert table._cached_runtime is not None
 
 
 def test_pipeline_builds_selected_structure_and_cells_once(
@@ -1203,11 +1423,16 @@ def test_windows_pyinstaller_first_table_call_from_thread_for_cpu_and_directml(
         pytest.skip("PyInstaller is not installed")
 
     project_root = Path(__file__).resolve().parents[1]
+    # The real package __init__ is bundled; only its eager non-table imports
+    # are stubbed to keep the frozen application small.
     fake_sources = {
-        "pdftopdfa/__init__.py": """
-from .table import TableType, recognize_table
-
-__all__ = ["TableType", "recognize_table"]
+        "pdftopdfa/converter.py": """
+ConversionResult = PDFUAReviewFinding = PDFUAStatus = None
+ProfileValidationResult = PublicationPolicy = None
+convert_directory = convert_files = convert_to_pdfa = None
+""",
+        "pdftopdfa/ocr.py": """
+OCRSession = recognize_image = None
 """,
         "paddleocr/__init__.py": """
 import threading
@@ -1250,7 +1475,7 @@ IMPORT_THREAD_IDENT = threading.current_thread().ident
         path = tmp_path / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source.lstrip(), encoding="utf-8")
-    for filename in ("_ocr_runtime.py", "exceptions.py", "table.py"):
+    for filename in ("__init__.py", "_ocr_runtime.py", "exceptions.py", "table.py"):
         source = project_root / "src" / "pdftopdfa" / filename
         (tmp_path / "pdftopdfa" / filename).write_bytes(source.read_bytes())
 
@@ -1265,19 +1490,22 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from pdftopdfa import TableType, recognize_table
-import paddleocr
-import pdftopdfa.table as table
-import scipy
-import sklearn
+import pdftopdfa
+
+RUNTIME_MODULES = ("paddleocr", "paddlex", "sklearn", "scipy")
 
 assert getattr(sys, "frozen", False)
-assert paddleocr.IMPORT_THREAD_IDENT == threading.main_thread().ident
-assert sklearn.IMPORT_THREAD_IDENT == threading.main_thread().ident
-assert scipy.IMPORT_THREAD_IDENT == threading.main_thread().ident
-assert table._cached_runtime is not None
-assert "sklearn" in sys.modules
-assert "scipy" in sys.modules
+assert {"prepare_table_runtime", "recognize_table"} <= set(dir(pdftopdfa))
+assert "pdftopdfa.table" not in sys.modules
+assert not [name for name in RUNTIME_MODULES if name in sys.modules]
+
+# pdftopdfa.table is deliberately not imported here, so the bundle only
+# contains it if PyInstaller found the lazy import in pdftopdfa/__init__.py.
+from pdftopdfa import OCRError, TableType, prepare_table_runtime, recognize_table
+
+table = sys.modules["pdftopdfa.table"]
+assert table._cached_runtime is None
+assert not [name for name in RUNTIME_MODULES if name in sys.modules]
 
 provider = sys.argv[1]
 prediction = [{"table_res_list": []}]
@@ -1289,8 +1517,6 @@ pipeline = SimpleNamespace(
     predict=lambda _input, **_kwargs: prediction,
     close=lambda: None,
 )
-table._create_table_classifier = lambda _model, _provider: classifier
-table._create_table_pipeline = lambda _type, _models, _provider: pipeline
 
 with tempfile.TemporaryDirectory() as temporary_directory:
     root = Path(temporary_directory)
@@ -1310,30 +1536,63 @@ with tempfile.TemporaryDirectory() as temporary_directory:
         (model_dir / "inference.yml").write_bytes(b"yaml")
         model_dirs[name] = model_dir
 
-    results = []
-    errors = []
+    def recognize_in_worker():
+        results = []
+        errors = []
 
-    def worker():
-        try:
-            results.append(
-                recognize_table(
-                    Image.new("RGB", (2, 2), "white"),
-                    ocr_execution_provider=provider,
-                    **model_dirs,
+        def worker():
+            try:
+                results.append(
+                    recognize_table(
+                        Image.new("RGB", (2, 2), "white"),
+                        ocr_execution_provider=provider,
+                        **model_dirs,
+                    )
                 )
-            )
-        except BaseException as exc:
-            errors.append(exc)
+            except BaseException as exc:
+                errors.append(exc)
 
-    thread = threading.Thread(target=worker, name="table-worker")
-    thread.start()
-    thread.join(60)
-    assert not thread.is_alive()
-    if errors:
-        raise errors[0]
+        thread = threading.Thread(target=worker, name="table-worker")
+        thread.start()
+        thread.join(60)
+        assert not thread.is_alive()
+        if errors:
+            raise errors[0]
+        assert len(results) == 1
+        return results[0]
 
-assert len(results) == 1
-assert results[0].table_type is TableType.WIRED
+    try:
+        recognize_in_worker()
+    except OCRError as exc:
+        assert "prepare_table_runtime()" in str(exc), exc
+    else:
+        raise AssertionError("unprepared worker initialized the table runtime")
+    assert table._cached_runtime is None
+    assert not [name for name in RUNTIME_MODULES if name in sys.modules]
+
+    prepare_table_runtime()
+    runtime = table._cached_runtime
+    assert runtime is not None
+    for name in ("paddleocr", "sklearn", "scipy"):
+        imported_by = sys.modules[name].IMPORT_THREAD_IDENT
+        assert imported_by == threading.main_thread().ident, name
+    prepare_table_runtime()
+    assert table._cached_runtime is runtime
+
+    def create_classifier(_model, _provider):
+        assert table._get_table_runtime() is runtime
+        return classifier
+
+    def create_pipeline(_type, _models, _provider):
+        assert table._get_table_runtime() is runtime
+        return pipeline
+
+    table._create_table_classifier = create_classifier
+    table._create_table_pipeline = create_pipeline
+    result = recognize_in_worker()
+
+assert result.table_type is TableType.WIRED
+assert table._cached_runtime is runtime
 assert table._cached_classifier_key[1] == provider
 assert table._cached_pipelines[TableType.WIRED][0][-1] == provider
 print(provider)

@@ -144,8 +144,10 @@ def _get_table_runtime() -> _TableRuntime:
             and threading.current_thread() is not threading.main_thread()
         ):
             raise OCRError(
-                "PaddleOCR table recognition must be imported on the main thread "
-                "before starting worker threads in a frozen Windows application"
+                "The PaddleOCR table runtime cannot be initialized first from a "
+                "worker thread in a frozen Windows application; call "
+                "pdftopdfa.prepare_table_runtime() on the main thread of the same "
+                "process before starting workers that recognize tables"
             )
 
         import paddleocr
@@ -160,6 +162,29 @@ def _get_table_runtime() -> _TableRuntime:
             paddlex_table=paddlex_table,
         )
         return _cached_runtime
+
+
+def prepare_table_runtime() -> None:
+    """Load the PaddleOCR table runtime in the current thread.
+
+    Only the PaddleOCR and PaddleX libraries are imported; table models are
+    still loaded on the first ``recognize_table()`` call. Repeated calls reuse
+    the loaded runtime.
+
+    Frozen Windows applications must call this on the main thread before
+    worker threads of the same process recognize tables, because the runtime
+    cannot be loaded first from a worker there. Table recognition on the main
+    thread needs no preparation. Loading failures raise ``OCRError``.
+    """
+    try:
+        _get_table_runtime()
+    except OCRError:
+        raise
+    except Exception as exc:
+        raise OCRError(
+            "Could not load the PaddleOCR table runtime: "
+            f"{_format_exception_message(exc)}"
+        ) from exc
 
 
 def _resolve_model_directory(
@@ -847,7 +872,3 @@ def _reset_model_cache_for_tests() -> None:
         _cached_classifier = None
         _cached_classifier_key = None
         _cached_pipelines.clear()
-
-
-if _is_frozen_windows() and threading.current_thread() is threading.main_thread():
-    _get_table_runtime()

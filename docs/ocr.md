@@ -479,10 +479,29 @@ reuse of the cached ONNX sessions.
 `ocr_execution_provider` accepts `"cpu"`, `"directml"`, or
 `"directml:INDEX"` and applies to classification and the selected table
 pipeline. DirectML requires the `directml` extra and uses the same strict
-no-CPU-fallback behavior as image and PDF OCR. In a frozen Windows application,
-import `pdftopdfa` or `pdftopdfa.table` on the main thread before starting
-workers so the table runtime can be preloaded; first loading it from a worker
-thread is rejected.
+no-CPU-fallback behavior as image and PDF OCR.
+
+Importing `pdftopdfa` or the table API does not load PaddleOCR or PaddleX. The
+table runtime is loaded on the first `recognize_table()` call, and each table
+model when it is first needed. In a frozen Windows application, such as a
+PyInstaller build, the table runtime cannot be loaded first from a worker
+thread. If worker threads recognize tables, call `prepare_table_runtime()` on
+the main thread of the same process before starting them:
+
+```python
+from pdftopdfa import prepare_table_runtime
+
+prepare_table_runtime()  # on the main thread, before table workers start
+```
+
+`prepare_table_runtime()` only imports PaddleOCR and PaddleX; table models are
+still loaded on the first recognition call. Repeated calls reuse the loaded
+runtime. Each process needs its own preparation: a reused child process that
+recognizes tables in worker threads calls it on its own main thread. Without
+it, the first table call from such a worker raises `OCRError`. Table calls on
+the main thread need no preparation, and other platforms and unfrozen
+applications do not require it. Because loading PaddleOCR and PaddleX can take
+noticeable time, prepare only processes that recognize tables.
 
 Use `pdfa=False` with a neutral output name such as `scan_processed.pdf` to
 write the result of a high-level PDF conversion call directly without font
