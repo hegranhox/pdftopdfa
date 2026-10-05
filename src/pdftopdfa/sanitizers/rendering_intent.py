@@ -217,6 +217,46 @@ def _clone_stream(pdf: Pdf, source: Stream) -> Stream:
     return clone
 
 
+def _iter_type3_font_slots(resources: Dictionary):
+    """Yield ``(container, slot, font)`` for Type3 fonts in ``resources``.
+
+    Like :func:`iter_type3_fonts`, but also returns where each font is
+    referenced (``/Font`` dictionary entry or ``/ExtGState`` ``/Font`` array)
+    so a per-context copy can be written back.
+    """
+    slots: list[tuple] = []
+    fonts = _resolve_indirect(resources.get("/Font"))
+    if isinstance(fonts, Dictionary):
+        slots.extend((fonts, name) for name in list(fonts.keys()))
+    states = _resolve_indirect(resources.get("/ExtGState"))
+    if isinstance(states, Dictionary):
+        for name in list(states.keys()):
+            state = _resolve_indirect(states[name])
+            if not isinstance(state, Dictionary):
+                continue
+            font_array = _resolve_indirect(state.get("/Font"))
+            if isinstance(font_array, Array) and len(font_array) == 2:
+                slots.append((font_array, 0))
+    for container, slot in slots:
+        font = _resolve_indirect(container[slot])
+        if isinstance(font, Dictionary) and str(font.get("/Subtype")) == "/Type3":
+            yield container, slot, font
+
+
+def _clone_type3_font(pdf: Pdf, font: Dictionary) -> Dictionary:
+    """Copy a Type3 font with its own ``/CharProcs`` dictionary.
+
+    Glyph streams and all other entries stay shared; the CharProcs that
+    actually need a different context are cloned afterwards by the normal
+    stream logic, into this copy's ``/CharProcs``.
+    """
+    clone = _clone_resources_shallow(font)
+    charprocs = _resolve_indirect(font.get("/CharProcs"))
+    if isinstance(charprocs, Dictionary):
+        clone[Name.CharProcs] = _clone_resources_shallow(charprocs)
+    return pdf.make_indirect(clone)
+
+
 def _clone_resource_context_streams(pdf: Pdf) -> int:
     """Clone streams that are reused under different resource dictionaries."""
     first_context: dict[
@@ -227,6 +267,8 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
     active: set[_ObjectIdentity] = set()
     processed_resources: set[tuple[int, int]] = set()
     processed_type3: set[tuple[_ObjectIdentity, _ObjectIdentity]] = set()
+    first_font_context: dict[_ObjectIdentity, _ObjectIdentity] = {}
+    font_clones: dict[tuple[_ObjectIdentity, _ObjectIdentity], Dictionary] = {}
     cloned = 0
 
     def resource_tasks(resources, resources_key) -> list[tuple]:
@@ -273,11 +315,25 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 ):
                     discovered.append(("stream", smask, Name.G, ctx))
 
-        for _font_name, font in iter_type3_fonts(resources, set()):
+        for font_container, font_slot, font in _iter_type3_font_slots(resources):
             font_resources = _resolve_indirect(font.get("/Resources"))
             if not isinstance(font_resources, Dictionary):
                 font_resources = resources
                 font_resources_key = resources_key
+                # The CharProcs inherit this context, but /CharProcs belongs
+                # to the font, so a font shared between contexts needs its
+                # own copy before its CharProcs can be cloned per context.
+                font_key = _object_identity(font)
+                prior_font_context = first_font_context.setdefault(
+                    font_key, resources_key
+                )
+                if prior_font_context != resources_key:
+                    clone_key = (font_key, resources_key)
+                    if clone_key not in font_clones:
+                        font_clones[clone_key] = _clone_type3_font(pdf, font)
+                    font = font_clones[clone_key]
+                    font_container[font_slot] = font
+                    first_font_context[_object_identity(font)] = resources_key
             else:
                 font_resources_key = _object_identity(font_resources)
             font_ctx = (font_resources, font_resources_key)

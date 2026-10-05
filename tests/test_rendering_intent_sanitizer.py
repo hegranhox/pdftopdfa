@@ -10,6 +10,7 @@ from conftest import new_pdf
 from pikepdf import Array, Dictionary, Name, Pdf
 
 import pdftopdfa.sanitizers.rendering_intent as rendering_intent
+from pdftopdfa.fonts.glyph_usage import find_ambiguous_resource_context_streams
 from pdftopdfa.sanitizers.extgstate import sanitize_extgstate
 from pdftopdfa.sanitizers.rendering_intent import (
     sanitize_rendering_intent,
@@ -1357,3 +1358,126 @@ class TestResourceContextKeyStability:
         sanitize_rendering_intent(pdf)
 
         assert pdf.Root.Pages.Resources.is_indirect
+
+
+def _type3_font_drawing_form(pdf: Pdf, form: pikepdf.Stream, resources=None):
+    """Type3 font whose single glyph draws ``/Fx`` from its context."""
+    charproc = pdf.make_stream(b"0 0 d0 /CS0 cs /Fx Do")
+    font = Dictionary(
+        Type=Name.Font,
+        Subtype=Name.Type3,
+        FontBBox=Array([0, 0, 1, 1]),
+        FontMatrix=Array([1, 0, 0, 1, 0, 0]),
+        CharProcs=Dictionary(a=charproc),
+        Encoding=Dictionary(Differences=Array([97, Name.a])),
+        FirstChar=97,
+        LastChar=97,
+        Widths=Array([1]),
+    )
+    if resources is not None:
+        font[Name.Resources] = resources
+    return pdf.make_indirect(font)
+
+
+def _page_with(pdf: Pdf, resources: Dictionary) -> pikepdf.Page:
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = resources
+    page.Contents = pdf.make_stream(b"BT /T 1 Tf (a) Tj ET")
+    return page
+
+
+class TestType3CharProcsPerContext:
+    """A Type3 font without /Resources is copied per calling context."""
+
+    def test_shared_font_is_copied_so_charprocs_get_their_context(self):
+        pdf = new_pdf()
+        form = _resourceless_form(pdf)
+        font = _type3_font_drawing_form(pdf, form)
+        for space in (Name.DeviceRGB, Name.DeviceGray):
+            _page_with(
+                pdf,
+                Dictionary(
+                    ColorSpace=Dictionary(CS0=space),
+                    Font=Dictionary(T=font),
+                    XObject=Dictionary(Fx=form),
+                ),
+            )
+
+        sanitize_rendering_intent(pdf)  # previously raised ConversionError
+
+        fonts = [page.Resources.Font.T for page in pdf.pages]
+        assert fonts[0].objgen == font.objgen
+        assert fonts[1].objgen != font.objgen
+        assert fonts[0].CharProcs.a.objgen != fonts[1].CharProcs.a.objgen
+        assert fonts[0].Resources.ColorSpace.CS0 == Name.DeviceRGB
+        assert fonts[1].Resources.ColorSpace.CS0 == Name.DeviceGray
+        assert find_ambiguous_resource_context_streams(pdf) == set()
+
+    def test_font_under_two_names_is_copied_once_per_context(self):
+        pdf = new_pdf()
+        form = _resourceless_form(pdf)
+        font = _type3_font_drawing_form(pdf, form)
+        _page_with(
+            pdf, Dictionary(Font=Dictionary(T=font), XObject=Dictionary(Fx=form))
+        )
+        page = _page_with(
+            pdf,
+            Dictionary(
+                ColorSpace=Dictionary(CS0=Name.DeviceGray),
+                Font=Dictionary(T=font, U=font),
+                XObject=Dictionary(Fx=form),
+            ),
+        )
+
+        rendering_intent._clone_resource_context_streams(pdf)
+
+        copy_t, copy_u = page.Resources.Font.T, page.Resources.Font.U
+        assert copy_t.objgen == copy_u.objgen != font.objgen
+
+    def test_font_referenced_from_extgstate_is_copied(self):
+        pdf = new_pdf()
+        form = _resourceless_form(pdf)
+        font = _type3_font_drawing_form(pdf, form)
+        for space in (Name.DeviceRGB, Name.DeviceGray):
+            _page_with(
+                pdf,
+                Dictionary(
+                    ColorSpace=Dictionary(CS0=space),
+                    ExtGState=Dictionary(GS0=Dictionary(Font=Array([font, 1]))),
+                    XObject=Dictionary(Fx=form),
+                ),
+            )
+
+        sanitize_rendering_intent(pdf)
+
+        first, second = (p.Resources.ExtGState.GS0.Font[0] for p in pdf.pages)
+        assert first.objgen != second.objgen
+        assert find_ambiguous_resource_context_streams(pdf) == set()
+
+    @pytest.mark.parametrize("own_resources", [False, True])
+    def test_font_not_copied_without_a_context_difference(self, own_resources):
+        """Equal contexts, or a font with its own /Resources: no copy."""
+        pdf = new_pdf()
+        form = _resourceless_form(pdf)
+        resources = (
+            pdf.make_indirect(Dictionary(XObject=Dictionary(Fx=form)))
+            if own_resources
+            else None
+        )
+        font = _type3_font_drawing_form(pdf, form, resources)
+        for space in (
+            Name.DeviceRGB,
+            Name.DeviceRGB if not own_resources else Name.DeviceGray,
+        ):
+            _page_with(
+                pdf,
+                Dictionary(
+                    ColorSpace=Dictionary(CS0=space),
+                    Font=Dictionary(T=font),
+                    XObject=Dictionary(Fx=form),
+                ),
+            )
+
+        rendering_intent._clone_resource_context_streams(pdf)
+
+        assert all(p.Resources.Font.T.objgen == font.objgen for p in pdf.pages)
