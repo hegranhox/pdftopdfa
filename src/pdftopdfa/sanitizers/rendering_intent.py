@@ -253,7 +253,8 @@ def _clone_type3_font(pdf: Pdf, font: Dictionary) -> Dictionary:
     clone = _clone_resources_shallow(font)
     charprocs = _resolve_indirect(font.get("/CharProcs"))
     if isinstance(charprocs, Dictionary):
-        clone[Name.CharProcs] = _clone_resources_shallow(charprocs)
+        # Indirect, so each copy's /CharProcs has its own identity.
+        clone[Name.CharProcs] = pdf.make_indirect(_clone_resources_shallow(charprocs))
     return pdf.make_indirect(clone)
 
 
@@ -268,7 +269,9 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
     processed_resources: set[tuple[int, int]] = set()
     processed_type3: set[tuple[_ObjectIdentity, _ObjectIdentity]] = set()
     first_font_context: dict[_ObjectIdentity, _ObjectIdentity] = {}
+    first_charprocs_context: dict[_ObjectIdentity, _ObjectIdentity] = {}
     font_clones: dict[tuple[_ObjectIdentity, _ObjectIdentity], Dictionary] = {}
+    stream_clones: dict[tuple[_ObjectIdentity, _ObjectIdentity], Stream] = {}
     cloned = 0
 
     def resource_tasks(resources, resources_key) -> list[tuple]:
@@ -323,17 +326,34 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 # The CharProcs inherit this context, but /CharProcs belongs
                 # to the font, so a font shared between contexts needs its
                 # own copy before its CharProcs can be cloned per context.
+                # Different fonts may also share one /CharProcs dictionary,
+                # so its first context counts as well as the font's.
                 font_key = _object_identity(font)
-                prior_font_context = first_font_context.setdefault(
-                    font_key, resources_key
+                font_moved = (
+                    first_font_context.setdefault(font_key, resources_key)
+                    != resources_key
                 )
-                if prior_font_context != resources_key:
+                charprocs_moved = False
+                font_charprocs = _resolve_indirect(font.get("/CharProcs"))
+                if isinstance(font_charprocs, Dictionary):
+                    charprocs_moved = (
+                        first_charprocs_context.setdefault(
+                            _object_identity(font_charprocs), resources_key
+                        )
+                        != resources_key
+                    )
+                if font_moved or charprocs_moved:
                     clone_key = (font_key, resources_key)
                     if clone_key not in font_clones:
                         font_clones[clone_key] = _clone_type3_font(pdf, font)
                     font = font_clones[clone_key]
                     font_container[font_slot] = font
                     first_font_context[_object_identity(font)] = resources_key
+                    copied_charprocs = _resolve_indirect(font.get("/CharProcs"))
+                    if isinstance(copied_charprocs, Dictionary):
+                        first_charprocs_context[_object_identity(copied_charprocs)] = (
+                            resources_key
+                        )
             else:
                 font_resources_key = _object_identity(font_resources)
             font_ctx = (font_resources, font_resources_key)
@@ -422,6 +442,16 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
 
             prior_context = first_context.setdefault(stream_key, context_key)
             if prior_context != context_key:
+                # Resource dictionaries with equal content are one context.
+                # Reuse the clone already made for this source and context,
+                # so such dictionaries receive identical writes and stay equal;
+                # a second clone would make them differ and leave anything
+                # they still share (a Type3 font, say) in two contexts.
+                existing = stream_clones.get((stream_key, context_key))
+                if existing is not None:
+                    container[key] = existing
+                    continue
+                source_key = stream_key
                 # Cloned resources can still point back to the source stream.
                 active.add(stream_key)
                 tasks.append(("exit", stream_key, None, None))
@@ -429,6 +459,7 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 container[key] = stream
                 stream_key = _stream_identity(stream)
                 first_context[stream_key] = context_key
+                stream_clones[(source_key, context_key)] = stream
                 cloned += 1
 
             processed.add((stream_key, context_key))

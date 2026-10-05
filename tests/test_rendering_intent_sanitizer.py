@@ -1481,3 +1481,67 @@ class TestType3CharProcsPerContext:
         rendering_intent._clone_resource_context_streams(pdf)
 
         assert all(p.Resources.Font.T.objgen == font.objgen for p in pdf.pages)
+
+
+class TestContextCloneReuse:
+    """Equal resource contexts get the same clones, so they stay equal."""
+
+    def _type3(self, pdf: Pdf, charprocs: Dictionary) -> Dictionary:
+        return pdf.make_indirect(
+            Dictionary(
+                Type=Name.Font,
+                Subtype=Name.Type3,
+                FontBBox=Array([0, 0, 1, 1]),
+                FontMatrix=Array([1, 0, 0, 1, 0, 0]),
+                CharProcs=charprocs,
+                Encoding=Dictionary(Differences=Array([97, Name.a])),
+                FirstChar=97,
+                LastChar=97,
+                Widths=Array([1]),
+            )
+        )
+
+    def test_identical_pages_share_clones_and_font_copy(self):
+        pdf = new_pdf()
+        logo = _resourceless_form(pdf)
+        charprocs = pdf.make_indirect(
+            Dictionary(a=pdf.make_stream(b"0 0 d0 0 0 1 1 re f"))
+        )
+        font = self._type3(pdf, charprocs)
+        cover = pdf.add_blank_page(page_size=(10, 10))
+        cover.Resources = pdf.make_indirect(Dictionary(XObject=Dictionary(Logo=logo)))
+        for space in (Name.DeviceRGB,) * 2 + (Name.DeviceGray,) * 2:
+            _page_with(
+                pdf,
+                Dictionary(
+                    ColorSpace=Dictionary(CS0=space),
+                    Font=Dictionary(T=font),
+                    XObject=Dictionary(Logo=logo),
+                ),
+            )
+
+        sanitize_rendering_intent(pdf)  # previously raised ConversionError
+
+        body = list(pdf.pages)[1:]
+        logos = [p.Resources.XObject.Logo.objgen for p in body]
+        assert logos[0] == logos[1] and logos[2] == logos[3]
+        assert len({*logos, logo.objgen}) == 3
+        assert find_ambiguous_resource_context_streams(pdf) == set()
+
+    def test_distinct_fonts_sharing_charprocs_are_separated(self):
+        pdf = new_pdf()
+        charprocs = pdf.make_indirect(
+            Dictionary(a=pdf.make_stream(b"0 0 d0 0 0 1 1 re f"))
+        )
+        fonts = [self._type3(pdf, charprocs) for _ in range(2)]
+        for space, font in zip((Name.DeviceRGB, Name.DeviceGray), fonts):
+            _page_with(
+                pdf,
+                Dictionary(ColorSpace=Dictionary(CS0=space), Font=Dictionary(T=font)),
+            )
+
+        sanitize_rendering_intent(pdf)  # previously raised ConversionError
+
+        first, second = (p.Resources.Font.T.CharProcs for p in pdf.pages)
+        assert first.objgen != second.objgen
+        assert find_ambiguous_resource_context_streams(pdf) == set()
