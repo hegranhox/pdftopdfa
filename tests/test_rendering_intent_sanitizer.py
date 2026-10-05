@@ -1285,3 +1285,75 @@ class TestOperatorArgCounts:
 
         result = sanitize_rendering_intent(pdf)
         assert result["bad_args_operators_removed"] == 1
+
+
+def _resourceless_form(pdf: Pdf) -> pikepdf.Stream:
+    form = pdf.make_stream(b"0 0 m 1 1 l S")
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = Array([0, 0, 1, 1])
+    return form
+
+
+def _count_clones(monkeypatch, limit: int) -> list[int]:
+    clone_stream = rendering_intent._clone_stream
+    count = [0]
+
+    def bounded_clone(pdf, source):
+        count[0] += 1
+        assert count[0] <= limit, "context key drifted: streams re-cloned"
+        return clone_stream(pdf, source)
+
+    monkeypatch.setattr(rendering_intent, "_clone_stream", bounded_clone)
+    return count
+
+
+class TestResourceContextKeyStability:
+    """Clones written into a direct /Resources must not change its context."""
+
+    @pytest.mark.parametrize("form_count", [2, 8, 25])
+    def test_sibling_forms_in_direct_resources_cloned_once(
+        self, monkeypatch, form_count: int
+    ):
+        pdf = new_pdf()
+        forms = {f"/F{i}": _resourceless_form(pdf) for i in range(form_count)}
+        for resources in (
+            pdf.make_indirect(Dictionary(XObject=Dictionary(forms))),
+            Dictionary(XObject=Dictionary(forms)),
+        ):
+            page = pdf.add_blank_page(page_size=(10, 10))
+            page.Resources = resources
+        count = _count_clones(monkeypatch, form_count)
+
+        assert rendering_intent._clone_resource_context_streams(pdf) == form_count
+        assert count[0] == form_count
+        first, second = (p.Resources.XObject for p in pdf.pages)
+        for name in forms:
+            assert first[name].objgen != second[name].objgen
+
+    def test_identical_direct_page_resources_share_a_context(self, monkeypatch):
+        """Equal direct dictionaries stay one context, as before (no bloat)."""
+        pdf = new_pdf()
+        logo = _resourceless_form(pdf)
+        for _ in range(20):
+            page = pdf.add_blank_page(page_size=(10, 10))
+            page.Resources = Dictionary(XObject=Dictionary(Logo=logo))
+        _count_clones(monkeypatch, 0)
+
+        assert rendering_intent._clone_resource_context_streams(pdf) == 0
+
+    def test_direct_inherited_resources_are_one_context(self, monkeypatch):
+        pdf = new_pdf()
+        forms = {f"/F{i}": _resourceless_form(pdf) for i in range(4)}
+        pdf.add_blank_page(page_size=(10, 10))
+        pdf.add_blank_page(page_size=(10, 10))
+        for page in pdf.pages:
+            del page.obj["/Resources"]
+        third = pdf.add_blank_page(page_size=(10, 10))
+        third.Resources = pdf.make_indirect(Dictionary(XObject=Dictionary(forms)))
+        pdf.Root.Pages.Resources = Dictionary(XObject=Dictionary(forms))
+        _count_clones(monkeypatch, 4)
+
+        sanitize_rendering_intent(pdf)
+
+        assert pdf.Root.Pages.Resources.is_indirect

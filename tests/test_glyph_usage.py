@@ -906,3 +906,37 @@ class TestFontUsageCache:
         cache.invalidate()
         assert cache.get()[font.objgen] == {66}
         assert cache.get(require_resolved_font=True)[font.objgen] == {66}
+
+
+def test_find_ambiguous_scales_with_resourceless_forms_in_direct_resources():
+    """Direct parent resources are serialized/expanded once, not per child."""
+    from pdftopdfa.fonts import glyph_usage
+
+    pdf = new_pdf()
+    forms = {}
+    for index in range(300):
+        form = pdf.make_stream(b"")
+        form[Name.Type] = Name.XObject
+        form[Name.Subtype] = Name.Form
+        form[Name.BBox] = Array([0, 0, 1, 1])
+        forms[f"/F{index}"] = form
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = Dictionary(XObject=Dictionary(forms))
+
+    calls = 0
+    original = glyph_usage._object_identity
+
+    def counting(obj):
+        nonlocal calls
+        calls += 1
+        return original(obj)
+
+    glyph_usage._object_identity = counting
+    try:
+        contexts = list(_iter_content_streams_with_resources(page))
+        assert glyph_usage.find_ambiguous_resource_context_streams(pdf) == set()
+    finally:
+        glyph_usage._object_identity = original
+
+    assert len(contexts) == 301  # page + 300 forms
+    assert calls < 10 * len(forms)  # was ~N^2 serializations of the dict

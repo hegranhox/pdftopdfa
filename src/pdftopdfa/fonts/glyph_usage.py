@@ -225,7 +225,7 @@ def _iter_stream_context(
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
     """Yield one stream/resource context and its graph without recursion."""
     yield from _iter_resource_graph(
-        [("stream", stream, resources)],
+        [("stream", stream, resources, None)],
         processed,
     )
 
@@ -236,20 +236,29 @@ def _iter_nested_streams(
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
     """Yield nested stream/resource contexts without using Python recursion."""
     yield from _iter_resource_graph(
-        [("resources", resources, None)],
+        [("resources", resources, None, None)],
         processed,
     )
 
 
 def _iter_resource_graph(
-    initial_tasks: list[tuple[str, pikepdf.Object, pikepdf.Object | None]],
+    initial_tasks: list[
+        tuple[str, pikepdf.Object, pikepdf.Object | None, _ObjectKey | None]
+    ],
     processed: set[_ContextKey],
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
-    """Walk content-bearing resource graphs with an explicit work stack."""
+    """Walk content-bearing resource graphs with an explicit work stack.
+
+    Each task may carry the precomputed identity of its resources so that a
+    direct dictionary is serialized once per expansion rather than once per
+    child, and each resources identity is expanded only once. Without this, a
+    direct dictionary with N resourceless Form XObjects was re-expanded for
+    every child and re-serialized for every task: O(N^3).
+    """
     tasks = list(reversed(initial_tasks))
 
     while tasks:
-        kind, obj, context_resources = tasks.pop()
+        kind, obj, context_resources, known_key = tasks.pop()
         if kind == "stream":
             stream = _resolve_indirect(obj)
             resources = _resolve_indirect(context_resources)
@@ -257,18 +266,28 @@ def _iter_resource_graph(
                 resources, pikepdf.Dictionary
             ):
                 continue
-            context = (_object_identity(stream), _object_identity(resources))
+            resources_key = (
+                known_key if known_key is not None else _object_identity(resources)
+            )
+            context = (_object_identity(stream), resources_key)
             if context in processed:
                 continue
             processed.add(context)
             yield stream, resources
-            tasks.append(("resources", resources, None))
+            tasks.append(("resources", resources, None, resources_key))
             continue
 
         resources = _resolve_indirect(obj)
         if not isinstance(resources, pikepdf.Dictionary):
             continue
-        discovered: list[tuple[str, pikepdf.Object, pikepdf.Object | None]] = []
+        key = known_key if known_key is not None else _object_identity(resources)
+        expanded_marker = ("expanded", key)
+        if expanded_marker in processed:
+            continue
+        processed.add(expanded_marker)
+        discovered: list[
+            tuple[str, pikepdf.Object, pikepdf.Object | None, _ObjectKey | None]
+        ] = []
 
         xobjects = _resolve_indirect(resources.get("/XObject"))
         if isinstance(xobjects, pikepdf.Dictionary):
@@ -279,10 +298,7 @@ def _iter_resource_graph(
                         isinstance(stream, pikepdf.Stream)
                         and str(stream.get("/Subtype")) == "/Form"
                     ):
-                        nested = _resolve_indirect(stream.get("/Resources"))
-                        if not isinstance(nested, pikepdf.Dictionary):
-                            nested = resources
-                        discovered.append(("stream", stream, nested))
+                        discovered.append(_stream_task(stream, resources, key))
                 except Exception:
                     continue
 
@@ -295,10 +311,7 @@ def _iter_resource_graph(
                         isinstance(stream, pikepdf.Stream)
                         and int(stream.get("/PatternType", 0)) == 1
                     ):
-                        nested = _resolve_indirect(stream.get("/Resources"))
-                        if not isinstance(nested, pikepdf.Dictionary):
-                            nested = resources
-                        discovered.append(("stream", stream, nested))
+                        discovered.append(_stream_task(stream, resources, key))
                 except Exception:
                     continue
 
@@ -318,22 +331,18 @@ def _iter_resource_graph(
                     subtype = stream.get("/Subtype")
                     if subtype is not None and str(subtype) != "/Form":
                         continue
-                    nested = _resolve_indirect(stream.get("/Resources"))
-                    if not isinstance(nested, pikepdf.Dictionary):
-                        nested = resources
-                    discovered.append(("stream", stream, nested))
+                    discovered.append(_stream_task(stream, resources, key))
                 except Exception:
                     continue
 
         for _name, font in iter_type3_fonts(resources, set()):
             try:
                 t3_resources = _resolve_indirect(font.get("/Resources"))
-                if not isinstance(t3_resources, pikepdf.Dictionary):
-                    t3_resources = resources
-                font_context = (
-                    _object_identity(font),
-                    _object_identity(t3_resources),
-                )
+                if isinstance(t3_resources, pikepdf.Dictionary):
+                    t3_key = _object_identity(t3_resources)
+                else:
+                    t3_resources, t3_key = resources, key
+                font_context = (_object_identity(font), t3_key)
                 if font_context in processed:
                     continue
                 processed.add(font_context)
@@ -342,13 +351,25 @@ def _iter_resource_graph(
                     for proc_name in list(charprocs.keys()):
                         proc = _resolve_indirect(charprocs[proc_name])
                         if isinstance(proc, pikepdf.Stream):
-                            discovered.append(("stream", proc, t3_resources))
-                if _object_identity(t3_resources) != _object_identity(resources):
-                    discovered.append(("resources", t3_resources, None))
+                            discovered.append(("stream", proc, t3_resources, t3_key))
+                if t3_key != key:
+                    discovered.append(("resources", t3_resources, None, t3_key))
             except Exception:
                 continue
 
         tasks.extend(reversed(discovered))
+
+
+def _stream_task(
+    stream: pikepdf.Stream,
+    parent: pikepdf.Dictionary,
+    parent_key: _ObjectKey,
+) -> tuple[str, pikepdf.Object, pikepdf.Object, _ObjectKey | None]:
+    """Build a stream task using own resources, else the parent's (keyed)."""
+    nested = _resolve_indirect(stream.get("/Resources"))
+    if isinstance(nested, pikepdf.Dictionary):
+        return ("stream", stream, nested, None)
+    return ("stream", stream, parent, parent_key)
 
 
 def _resolve_font_object(
