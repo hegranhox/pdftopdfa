@@ -223,7 +223,43 @@ def _page_uses_transparency(page) -> bool:
     return False
 
 
-def _detect_page_dominant_cs(page) -> ColorSpaceType:
+_COLOR_OPERATORS = "g G rg RG k K cs CS"
+
+
+def _stream_color_flags(stream, cache: dict | None) -> tuple[bool, bool, bool]:
+    """Return ``(gray, rgb, cmyk)`` device colour use of one content stream."""
+    key = stream.objgen if stream.objgen != (0, 0) else None
+    if cache is not None and key is not None and key in cache:
+        return cache[key]
+    has_gray = has_rgb = has_cmyk = False
+    try:
+        for operands, operator in pikepdf.parse_content_stream(
+            stream, _COLOR_OPERATORS
+        ):
+            op_name = str(operator)
+            if op_name in _CMYK_OPERATORS:
+                has_cmyk = True
+            elif op_name in _RGB_OPERATORS:
+                has_rgb = True
+            elif op_name in _GRAY_OPERATORS:
+                has_gray = True
+            elif op_name in _CS_OPERATORS and operands:
+                cs_name = operands[0]
+                if cs_name == Name.DeviceCMYK:
+                    has_cmyk = True
+                elif cs_name == Name.DeviceRGB:
+                    has_rgb = True
+                elif cs_name == Name.DeviceGray:
+                    has_gray = True
+    except (pikepdf.PdfError, AttributeError, IndexError, TypeError):
+        pass
+    flags = (has_gray, has_rgb, has_cmyk)
+    if cache is not None and key is not None:
+        cache[key] = flags
+    return flags
+
+
+def _detect_page_dominant_cs(page, stream_cache: dict | None = None) -> ColorSpaceType:
     """Detect the dominant color space used on a page.
 
     Parses the content stream for color operators and checks Image
@@ -292,30 +328,10 @@ def _detect_page_dominant_cs(page) -> ColorSpaceType:
         for owner, resources in _iter_content_streams_with_resources(page):
             owner = _resolve_indirect(owner)
             if isinstance(owner, Stream):
-                try:
-                    for operands, operator in pikepdf.parse_content_stream(owner):
-                        op_name = str(operator)
-                        if op_name in _CMYK_OPERATORS:
-                            has_cmyk = True
-                        elif op_name in _RGB_OPERATORS:
-                            has_rgb = True
-                        elif op_name in _GRAY_OPERATORS:
-                            has_gray = True
-                        elif op_name in _CS_OPERATORS and operands:
-                            cs_name = operands[0]
-                            if cs_name == Name.DeviceCMYK:
-                                has_cmyk = True
-                            elif cs_name == Name.DeviceRGB:
-                                has_rgb = True
-                            elif cs_name == Name.DeviceGray:
-                                has_gray = True
-                except (
-                    pikepdf.PdfError,
-                    AttributeError,
-                    IndexError,
-                    TypeError,
-                ):
-                    pass
+                gray, rgb, cmyk = _stream_color_flags(owner, stream_cache)
+                has_gray |= gray
+                has_rgb |= rgb
+                has_cmyk |= cmyk
 
             resources = _resolve_indirect(resources)
             if not isinstance(resources, Dictionary):
@@ -366,6 +382,8 @@ def _add_missing_transparency_groups(
         Number of pages where /Group was added.
     """
     added = 0
+    # Shared streams (Type3 glyphs, forms) are parsed once for all pages.
+    stream_color_cache: dict = {}
 
     for page in pdf.pages:
         # Skip pages that already have /Group
@@ -377,7 +395,7 @@ def _add_missing_transparency_groups(
             continue
 
         # Detect dominant color space for this page
-        cs_type = _detect_page_dominant_cs(page)
+        cs_type = _detect_page_dominant_cs(page, stream_color_cache)
 
         # Create /Group with ICCBased /CS
         icc_cs = _create_icc_colorspace(pdf, cs_type, icc_stream_cache)

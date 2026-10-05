@@ -34,6 +34,8 @@ _TEXT_OPERATORS = frozenset(
         pikepdf.Operator('"'),
     }
 )
+# Operators _process_content_stream acts on (graphics state, font, text).
+_USAGE_OPERATORS = "q Q gs Tf Tj TJ ' \""
 
 _TF_OPERATOR = pikepdf.Operator("Tf")
 _Q_OPERATOR = pikepdf.Operator("q")
@@ -545,6 +547,9 @@ def collect_font_usage(
     """
     usage: dict[_ObjectKey, set[CharacterCode]] = {}
     unresolved_usage: dict[_ObjectKey, set[CharacterCode]] = {}
+    # Shared streams (Type3 glyphs, reused forms) are reached once per page;
+    # parse each one only once per collection.
+    parse_cache: dict[_ObjectKey, list] = {}
 
     for page in pdf.pages:
         # A nested stream can inherit a font even with its own empty Resources.
@@ -552,7 +557,12 @@ def collect_font_usage(
         page_fonts = tuple(font for _name, font in iter_all_page_fonts(page))
         for stream_owner, resources in _iter_content_streams_with_resources(page):
             _process_content_stream(
-                stream_owner, resources, usage, page_fonts, unresolved_usage
+                stream_owner,
+                resources,
+                usage,
+                page_fonts,
+                unresolved_usage,
+                parse_cache,
             )
 
     for font_key, codes in unresolved_usage.items():
@@ -567,6 +577,7 @@ def _process_content_stream(
     usage: dict[_ObjectKey, set[CharacterCode]],
     page_fonts: tuple[pikepdf.Object, ...],
     unresolved_usage: dict[_ObjectKey, set[CharacterCode]],
+    parse_cache: dict[_ObjectKey, list] | None = None,
 ) -> None:
     """Parses a content stream and records character code usage.
 
@@ -574,10 +585,27 @@ def _process_content_stream(
         stream_owner: Object that owns the content stream (page or XObject).
         resources: Resources dictionary for font resolution.
         usage: Accumulator mapping font objgen -> used character codes.
+        parse_cache: Optional per-collection cache of parsed streams.
     """
-    try:
-        instructions = pikepdf.parse_content_stream(stream_owner)
-    except Exception:
+    cache_key = None
+    if parse_cache is not None and isinstance(stream_owner, pikepdf.Stream):
+        cache_key = _object_identity(stream_owner)
+    if cache_key is not None and cache_key in parse_cache:
+        instructions = parse_cache[cache_key]
+    else:
+        try:
+            # Only these operators affect glyph usage; the whitelist also
+            # spares pikepdf building objects for inline image data.
+            instructions = list(
+                pikepdf.parse_content_stream(stream_owner, _USAGE_OPERATORS)
+            )
+        except Exception:
+            instructions = []
+        if not any(operator in _TEXT_OPERATORS for _, operator in instructions):
+            instructions = []
+        if cache_key is not None:
+            parse_cache[cache_key] = instructions
+    if not instructions:
         return
 
     current_font: pikepdf.Object | None = None

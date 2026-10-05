@@ -940,3 +940,39 @@ def test_find_ambiguous_scales_with_resourceless_forms_in_direct_resources():
 
     assert len(contexts) == 301  # page + 300 forms
     assert calls < 10 * len(forms)  # was ~N^2 serializations of the dict
+
+
+def test_collect_font_usage_parses_shared_stream_once_per_collection(monkeypatch):
+    """A form shared by pages is parsed once, but resolved per context."""
+    from pdftopdfa.fonts import glyph_usage
+
+    pdf = new_pdf()
+    form = pdf.make_stream(b"BT /F1 1 Tf (ab) Tj ET")
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = Array([0, 0, 1, 1])
+    fonts = []
+    for base in (Name.Helvetica, Name.Courier):
+        font = pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=base)
+        )
+        fonts.append(font)
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.Resources = Dictionary(
+            Font=Dictionary(F1=font), XObject=Dictionary(Fm=form)
+        )
+
+    parsed = []
+    original = pikepdf.parse_content_stream
+
+    def counting(target, *args):
+        if isinstance(target, pikepdf.Stream) and target.objgen == form.objgen:
+            parsed.append(target.objgen)
+        return original(target, *args)
+
+    monkeypatch.setattr(glyph_usage.pikepdf, "parse_content_stream", counting)
+    usage = collect_font_usage(pdf)
+
+    assert len(parsed) == 1
+    for font in fonts:  # the shared form still counts for each page's font
+        assert usage[font.objgen] == {ord("a"), ord("b")}
