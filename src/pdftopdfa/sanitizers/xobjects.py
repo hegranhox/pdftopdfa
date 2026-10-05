@@ -11,7 +11,9 @@ from pikepdf import Array, Dictionary, Name, Pdf, Stream
 from pikepdf import parse_content_stream as _parse_content_stream
 from pikepdf import unparse_content_stream as _unparse_content_stream
 
-from ..fonts.glyph_usage import _iter_content_streams_with_resources
+from ..fonts.glyph_usage import (
+    iter_content_streams_with_resource_info,
+)
 from ..utils import log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 from .base import FORBIDDEN_XOBJECT_SUBTYPES
@@ -259,7 +261,14 @@ def remove_forbidden_xobjects(pdf: Pdf) -> int:
             )
 
     for page in pdf.pages:
-        for _owner, resources in _iter_content_streams_with_resources(page):
+        for (
+            _owner,
+            resources,
+            _key,
+            inherited,
+        ) in iter_content_streams_with_resource_info(page):
+            if inherited:  # same resources object as already handled
+                continue
             resources = _resolve_indirect(resources)
             if not isinstance(resources, Dictionary):
                 continue
@@ -646,14 +655,19 @@ def fix_image_interpolate(pdf: Pdf) -> int:
             )
 
     for page in pdf.pages:
-        for owner, resources in _iter_content_streams_with_resources(page):
+        for (
+            owner,
+            resources,
+            _key,
+            inherited,
+        ) in iter_content_streams_with_resource_info(page):
             owner = _resolve_indirect(owner)
             resources = _resolve_indirect(resources)
             if isinstance(owner, Stream):
                 fixed_count += _fix_inline_interpolate_in_stream_once(
                     owner, visited_inline_streams
                 )
-            if not isinstance(resources, Dictionary):
+            if inherited or not isinstance(resources, Dictionary):
                 continue
             xobjects = _resolve_indirect(resources.get("/XObject"))
             if isinstance(xobjects, Dictionary):
@@ -1132,7 +1146,14 @@ def fix_bits_per_component(pdf: Pdf) -> dict[str, int]:
             )
 
     for page in pdf.pages:
-        for _owner, resources in _iter_content_streams_with_resources(page):
+        for (
+            _owner,
+            resources,
+            _key,
+            inherited,
+        ) in iter_content_streams_with_resource_info(page):
+            if inherited:
+                continue
             resources = _resolve_indirect(resources)
             if not isinstance(resources, Dictionary):
                 continue
