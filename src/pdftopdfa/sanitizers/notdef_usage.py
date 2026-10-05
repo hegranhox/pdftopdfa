@@ -125,10 +125,11 @@ def sanitize_notdef_usage(pdf: Pdf) -> dict[str, int]:
     # Non-ambiguous streams have one resource context, so a stream reached
     # again from another page (shared glyphs, forms) needs no second pass.
     fixed_streams: set[tuple[int, int]] = set()
+    walked: set = set()
 
     for page_num, page in enumerate(pdf.pages, start=1):
         try:
-            for owner, resources in _iter_content_streams_with_resources(page):
+            for owner, resources in _iter_content_streams_with_resources(page, walked):
                 if isinstance(owner, Stream):
                     objgen = owner.objgen
                     if objgen != (0, 0) and objgen in ambiguous_streams:

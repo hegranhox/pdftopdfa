@@ -99,6 +99,7 @@ def _extract_char_codes(
 
 def _iter_content_streams_with_resources(
     page: pikepdf.Page,
+    processed: set[_ContextKey] | None = None,
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object]]:
     """Yields (content_stream_owner, resources) for all nested structures on a page.
 
@@ -108,10 +109,17 @@ def _iter_content_streams_with_resources(
     Args:
         page: A pikepdf Page object.
 
+        processed: Optional context set shared across pages. Pass one set
+            for a whole-document walk to visit each (stream, resources)
+            context once instead of once per page; the page itself is
+            always yielded. Only for callers that do not need per-page
+            results for shared streams.
+
     Yields:
         Tuples of (stream_owner, resources_dict).
     """
-    processed: set[_ContextKey] = set()
+    if processed is None:
+        processed = set()
 
     # Page-level
     resources = get_page_resources(page)
@@ -267,6 +275,7 @@ def find_ambiguous_resource_context_streams(
         _ObjectKey,
         set[_ObjectKey],
     ] = defaultdict(set)
+    walked: set[_ContextKey] = set()  # contexts are aggregated document-wide
     for page in pdf.pages:
         page_resources = get_page_resources(page)
         if isinstance(page_resources, pikepdf.Dictionary):
@@ -280,7 +289,7 @@ def find_ambiguous_resource_context_streams(
                 if isinstance(content, pikepdf.Stream):
                     contexts[_object_identity(content)].add(resource_key)
 
-        for owner, resources in _iter_content_streams_with_resources(page):
+        for owner, resources in _iter_content_streams_with_resources(page, walked):
             if isinstance(owner, pikepdf.Stream):
                 contexts[_object_identity(owner)].add(_object_identity(resources))
 

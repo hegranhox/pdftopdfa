@@ -1223,8 +1223,19 @@ def sanitize_structure_limits(
                 processed_streams.add(objgen)
             _sanitize_content_stream(pdf, stream, stats, resources, bbox)
 
+    walked: set = set()  # each stream is sanitized once, so walk once
     for page in pdf.pages:
-        for owner, resources in _iter_content_streams_with_resources(page):
+        for owner, resources in _iter_content_streams_with_resources(page, walked):
+            pending = []
+            for stream in _iter_owner_streams(owner):
+                objgen = _indirect_objgen(stream)
+                if objgen is not None:
+                    if objgen in processed_streams:
+                        continue
+                    processed_streams.add(objgen)
+                pending.append(stream)
+            if not pending:
+                continue
             resources = _resolve(resources)
             if not isinstance(resources, Dictionary):
                 resources = None
@@ -1234,12 +1245,7 @@ def sanitize_structure_limits(
                     bbox = Array(list(page.mediabox))
                 except Exception:
                     bbox = None
-            for stream in _iter_owner_streams(owner):
-                objgen = _indirect_objgen(stream)
-                if objgen is not None:
-                    if objgen in processed_streams:
-                        continue
-                    processed_streams.add(objgen)
+            for stream in pending:
                 _sanitize_content_stream(pdf, stream, stats, resources, bbox)
 
     # The passes above rewrite strings, names, operands and q/Q nesting in
