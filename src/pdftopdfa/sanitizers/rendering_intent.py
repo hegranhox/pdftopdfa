@@ -19,7 +19,10 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, Stream
 
 from ..exceptions import ConversionError
-from ..fonts.glyph_usage import find_ambiguous_resource_context_streams
+from ..fonts.glyph_usage import (
+    find_ambiguous_resource_context_streams,
+    stream_uses_named_resources,
+)
 from ..utils import iter_type3_fonts, log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
 
@@ -243,6 +246,18 @@ def _iter_type3_font_slots(resources: Dictionary):
             yield container, slot, font
 
 
+def _type3_glyphs_use_names(font: Dictionary, cache: dict) -> bool:
+    """Return whether any CharProc of ``font`` looks up a resource name."""
+    charprocs = _resolve_indirect(font.get("/CharProcs"))
+    if not isinstance(charprocs, Dictionary):
+        return False
+    return any(
+        isinstance(proc, Stream)
+        and ("/Resources" in proc or stream_uses_named_resources(proc, cache))
+        for _name, proc in charprocs.items()
+    )
+
+
 def _clone_type3_font(pdf: Pdf, font: Dictionary) -> Dictionary:
     """Copy a Type3 font with its own ``/CharProcs`` dictionary.
 
@@ -270,6 +285,7 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
     processed_type3: set[tuple[_ObjectIdentity, _ObjectIdentity]] = set()
     first_font_context: dict[_ObjectIdentity, _ObjectIdentity] = {}
     first_charprocs_context: dict[_ObjectIdentity, _ObjectIdentity] = {}
+    uses_names: dict[_ObjectIdentity, bool] = {}
     font_clones: dict[tuple[_ObjectIdentity, _ObjectIdentity], Dictionary] = {}
     stream_clones: dict[tuple[_ObjectIdentity, _ObjectIdentity], Stream] = {}
     cloned = 0
@@ -342,7 +358,9 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                         )
                         != resources_key
                     )
-                if font_moved or charprocs_moved:
+                if (font_moved or charprocs_moved) and _type3_glyphs_use_names(
+                    font, uses_names
+                ):
                     clone_key = (font_key, resources_key)
                     if clone_key not in font_clones:
                         font_clones[clone_key] = _clone_type3_font(pdf, font)
@@ -441,6 +459,14 @@ def _clone_resource_context_streams(pdf: Pdf) -> int:
                 continue
 
             prior_context = first_context.setdefault(stream_key, context_key)
+            if (
+                prior_context != context_key
+                and "/Resources" not in stream
+                and not stream_uses_named_resources(stream, uses_names)
+            ):
+                # Looks up no resource names: identical in every context.
+                processed.add((stream_key, context_key))
+                continue
             if prior_context != context_key:
                 # Resource dictionaries with equal content are one context.
                 # Reuse the clone already made for this source and context,

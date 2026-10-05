@@ -1288,8 +1288,8 @@ class TestOperatorArgCounts:
         assert result["bad_args_operators_removed"] == 1
 
 
-def _resourceless_form(pdf: Pdf) -> pikepdf.Stream:
-    form = pdf.make_stream(b"0 0 m 1 1 l S")
+def _resourceless_form(pdf: Pdf, body: bytes = b"/CS0 cs 0 0 m 1 1 l S"):
+    form = pdf.make_stream(body)
     form[Name.Type] = Name.XObject
     form[Name.Subtype] = Name.Form
     form[Name.BBox] = Array([0, 0, 1, 1])
@@ -1505,7 +1505,7 @@ class TestContextCloneReuse:
         pdf = new_pdf()
         logo = _resourceless_form(pdf)
         charprocs = pdf.make_indirect(
-            Dictionary(a=pdf.make_stream(b"0 0 d0 0 0 1 1 re f"))
+            Dictionary(a=pdf.make_stream(b"0 0 d0 /CS0 cs 0 0 1 1 re f"))
         )
         font = self._type3(pdf, charprocs)
         cover = pdf.add_blank_page(page_size=(10, 10))
@@ -1531,7 +1531,7 @@ class TestContextCloneReuse:
     def test_distinct_fonts_sharing_charprocs_are_separated(self):
         pdf = new_pdf()
         charprocs = pdf.make_indirect(
-            Dictionary(a=pdf.make_stream(b"0 0 d0 0 0 1 1 re f"))
+            Dictionary(a=pdf.make_stream(b"0 0 d0 /CS0 cs 0 0 1 1 re f"))
         )
         fonts = [self._type3(pdf, charprocs) for _ in range(2)]
         for space, font in zip((Name.DeviceRGB, Name.DeviceGray), fonts):
@@ -1545,3 +1545,52 @@ class TestContextCloneReuse:
         first, second = (p.Resources.Font.T.CharProcs for p in pdf.pages)
         assert first.objgen != second.objgen
         assert find_ambiguous_resource_context_streams(pdf) == set()
+
+
+class TestNameFreeStreamsAreNotCloned:
+    """Streams that look up no resource names need no per-context copies."""
+
+    @pytest.mark.parametrize(
+        ("body", "uses_names"),
+        [
+            (b"0 0 m 1 1 l S", False),
+            (b"0 0 d0 0 0 1 1 re f", False),
+            (b"/DeviceRGB cs 1 0 0 sc 0 0 1 1 re f", False),
+            (b"BI /W 1 /H 1 /IM true ID \x00 EI", False),
+            (b"/CS0 cs 0 0 1 1 re f", True),
+            (b"/GS0 gs", True),
+            (b"/Fm Do", True),
+            (b"BT /F1 1 Tf ET", True),
+            (b"/P0 scn", True),
+            (b"/OC /MC0 BDC EMC", True),
+            (b"BI /W 1 /H 1 /CS /CS0 /BPC 8 ID \x00 EI", True),
+        ],
+    )
+    def test_stream_uses_named_resources(self, body: bytes, uses_names: bool):
+        from pdftopdfa.fonts.glyph_usage import stream_uses_named_resources
+
+        pdf = new_pdf()
+        assert stream_uses_named_resources(pdf.make_stream(body)) is uses_names
+
+    def test_shared_name_free_glyphs_and_forms_are_not_copied(self):
+        pdf = new_pdf()
+        logo = _resourceless_form(pdf, b"0 0 m 1 1 l S")
+        charprocs = pdf.make_indirect(
+            Dictionary(a=pdf.make_stream(b"0 0 d0 0 0 1 1 re f"))
+        )
+        font = TestContextCloneReuse()._type3(pdf, charprocs)
+        for space in (Name.DeviceRGB, Name.DeviceGray):
+            _page_with(
+                pdf,
+                Dictionary(
+                    ColorSpace=Dictionary(CS0=space),
+                    Font=Dictionary(T=font),
+                    XObject=Dictionary(Logo=logo),
+                ),
+            )
+
+        assert rendering_intent._clone_resource_context_streams(pdf) == 0
+        sanitize_rendering_intent(pdf)
+
+        assert {p.Resources.Font.T.objgen for p in pdf.pages} == {font.objgen}
+        assert {p.Resources.XObject.Logo.objgen for p in pdf.pages} == {logo.objgen}

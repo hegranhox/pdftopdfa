@@ -186,10 +186,81 @@ def _object_identity(obj: pikepdf.Object) -> _ObjectKey:
     return key if key != (0, 0) else ("direct", obj.unparse())
 
 
+_DEVICE_COLOR_SPACES = frozenset(
+    {
+        "/DeviceGray",
+        "/DeviceRGB",
+        "/DeviceCMYK",
+        "/Pattern",
+        "/G",
+        "/RGB",
+        "/CMYK",
+        "/I",
+        "/Indexed",
+    }
+)
+_NAMED_RESOURCE_OPERATORS = frozenset({"Tf", "Do", "gs", "sh"})
+
+
+def stream_uses_named_resources(
+    stream: pikepdf.Stream, cache: dict[_ObjectKey, bool] | None = None
+) -> bool:
+    """Return whether a content stream looks up any name in its resources.
+
+    Streams that never do (plain path glyphs, most Type3 CharProcs) render
+    the same in every resource context, so they never need per-context
+    copies. Any doubt (unreadable or unparsable data) answers True.
+    """
+    key = _object_identity(stream)
+    if cache is not None and key in cache:
+        return cache[key]
+    result = _scan_named_resources(stream)
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def _scan_named_resources(stream: pikepdf.Stream) -> bool:
+    try:
+        if b"/" not in stream.read_bytes():
+            return False  # no name operands at all
+        for instruction in pikepdf.parse_content_stream(stream):
+            if isinstance(instruction, pikepdf.ContentStreamInlineImage):
+                image = instruction.iimage.obj
+                space = image.get("/CS", image.get("/ColorSpace"))
+                if space is not None and not (
+                    isinstance(space, pikepdf.Name)
+                    and str(space) in _DEVICE_COLOR_SPACES
+                ):
+                    return True
+                continue
+            operator = str(instruction.operator)
+            operands = instruction.operands
+            if operator in _NAMED_RESOURCE_OPERATORS:
+                return True
+            if operator in ("cs", "CS"):
+                if not operands or str(operands[0]) not in _DEVICE_COLOR_SPACES:
+                    return True
+            elif operator in ("scn", "SCN"):
+                if operands and isinstance(operands[-1], pikepdf.Name):
+                    return True
+            elif operator in ("BDC", "DP"):
+                if len(operands) > 1 and isinstance(operands[1], pikepdf.Name):
+                    return True
+        return False
+    except Exception:
+        return True
+
+
 def find_ambiguous_resource_context_streams(
     pdf: pikepdf.Pdf,
 ) -> set[_ObjectKey]:
-    """Return content streams reused with different effective resources."""
+    """Return content streams reused with different effective resources.
+
+    A stream without its own ``/Resources`` that never looks up a resource
+    name renders identically in every context and is not reported.
+    """
+    uses_names: dict[_ObjectKey, bool] = {}
     contexts: dict[
         _ObjectKey,
         set[_ObjectKey],
@@ -211,11 +282,19 @@ def find_ambiguous_resource_context_streams(
             if isinstance(owner, pikepdf.Stream):
                 contexts[_object_identity(owner)].add(_object_identity(resources))
 
-    return {
-        stream_key
-        for stream_key, resource_keys in contexts.items()
-        if len(resource_keys) > 1
-    }
+    ambiguous = set()
+    for stream_key, resource_keys in contexts.items():
+        if len(resource_keys) < 2:
+            continue
+        stream = pdf.get_object(stream_key) if stream_key[0] != "direct" else None
+        if (
+            isinstance(stream, pikepdf.Stream)
+            and "/Resources" not in stream
+            and not stream_uses_named_resources(stream, uses_names)
+        ):
+            continue
+        ambiguous.add(stream_key)
+    return ambiguous
 
 
 def _iter_stream_context(
@@ -274,7 +353,10 @@ def _iter_resource_graph(
                 continue
             processed.add(context)
             yield stream, resources
-            tasks.append(("resources", resources, None, resources_key))
+            # Most streams (all CharProcs, resourceless forms) use the parent
+            # resources, which are already expanded; skip the no-op task.
+            if ("expanded", resources_key) not in processed:
+                tasks.append(("resources", resources, None, resources_key))
             continue
 
         resources = _resolve_indirect(obj)
@@ -348,10 +430,11 @@ def _iter_resource_graph(
                 processed.add(font_context)
                 charprocs = _resolve_indirect(font.get("/CharProcs"))
                 if isinstance(charprocs, pikepdf.Dictionary):
-                    for proc_name in list(charprocs.keys()):
-                        proc = _resolve_indirect(charprocs[proc_name])
-                        if isinstance(proc, pikepdf.Stream):
-                            discovered.append(("stream", proc, t3_resources, t3_key))
+                    discovered.extend(
+                        ("stream", proc, t3_resources, t3_key)
+                        for _proc_name, proc in charprocs.items()
+                        if isinstance(proc, pikepdf.Stream)
+                    )
                 if t3_key != key:
                     discovered.append(("resources", t3_resources, None, t3_key))
             except Exception:
