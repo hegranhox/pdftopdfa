@@ -12,7 +12,7 @@ be kept in the font program.
 """
 
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 import pikepdf
 
@@ -302,6 +302,60 @@ def _scan_named_resources(stream: pikepdf.Stream) -> bool:
         return False
     except Exception:
         return True
+
+
+_NAME_OPERATOR_CATEGORIES = {
+    "Tf": "/Font",
+    "Do": "/XObject",
+    "gs": "/ExtGState",
+    "sh": "/Shading",
+    "cs": "/ColorSpace",
+    "CS": "/ColorSpace",
+}
+
+
+def used_resource_names(
+    streams: Iterable[pikepdf.Stream],
+) -> dict[str, set[str]] | None:
+    """Return the resource names the given content streams look up.
+
+    Maps each resource category (``/Font``, ``/XObject``, ...) to the names
+    used from it. Returns None when any stream cannot be read or parsed, so
+    callers fall back to keeping every inherited resource.
+    """
+    used: dict[str, set[str]] = defaultdict(set)
+    for stream in streams:
+        try:
+            if b"/" not in stream.read_bytes():
+                continue
+            instructions = list(pikepdf.parse_content_stream(stream))
+        except Exception:
+            return None
+        for instruction in instructions:
+            if isinstance(instruction, pikepdf.ContentStreamInlineImage):
+                image = instruction.iimage.obj
+                space = image.get("/CS", image.get("/ColorSpace"))
+                if isinstance(space, pikepdf.Name):
+                    if str(space) not in _DEVICE_COLOR_SPACES:
+                        used["/ColorSpace"].add(str(space))
+                elif space is not None:  # e.g. [/Indexed /CS0 ...]
+                    return None
+                continue
+            operator = str(instruction.operator)
+            operands = instruction.operands
+            category = _NAME_OPERATOR_CATEGORIES.get(operator)
+            if category is not None:
+                if operands and isinstance(operands[0], pikepdf.Name):
+                    name = str(operands[0])
+                    if category != "/ColorSpace" or name not in _DEVICE_COLOR_SPACES:
+                        used[category].add(name)
+            elif operator in ("scn", "SCN"):
+                if operands and isinstance(operands[-1], pikepdf.Name):
+                    used["/Pattern"].add(str(operands[-1]))
+            elif operator in ("BDC", "DP"):
+                if len(operands) > 1 and isinstance(operands[1], pikepdf.Name):
+                    used["/Properties"].add(str(operands[1]))
+    return dict(used)
 
 
 def find_ambiguous_resource_context_streams(

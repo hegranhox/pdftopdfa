@@ -1594,3 +1594,51 @@ class TestNameFreeStreamsAreNotCloned:
 
         assert {p.Resources.Font.T.objgen for p in pdf.pages} == {font.objgen}
         assert {p.Resources.XObject.Logo.objgen for p in pdf.pages} == {logo.objgen}
+
+
+class TestExplicitResourcesInheritOnlyUsedNames:
+    """Made-explicit /Resources must not copy the whole parent dictionary."""
+
+    def _build(self) -> tuple[Pdf, pikepdf.Stream, Dictionary]:
+        pdf = new_pdf()
+        form = _resourceless_form(pdf, b"0 0 m 100 0 l S")  # uses no names
+        glyph = pdf.make_stream(
+            b"10 0 0 0 10 10 d1 BI /W 8 /H 1 /IM true /BPC 1 ID \x00 EI"
+        )
+        font = TestContextCloneReuse()._type3(pdf, Dictionary(a=glyph))
+        for with_font in (True, False, True):
+            resources = Dictionary(XObject=Dictionary(X=form))
+            if with_font:
+                resources[Name.Font] = Dictionary(F0=font)
+            page = pdf.add_blank_page(page_size=(10, 10))
+            page.Resources = resources
+            page.Contents = pdf.make_stream(b"/X Do")
+        return pdf, form, font
+
+    def test_type3_font_and_form_do_not_form_a_resource_cycle(self):
+        pdf, form, font = self._build()
+
+        sanitize_rendering_intent(pdf)
+
+        font = pdf.pages[0].Resources.Font.F0
+        form = pdf.pages[0].Resources.XObject.X
+        assert "/Resources" in font and "/Resources" in form  # explicit
+        assert "/XObject" not in font.Resources  # glyphs draw no XObject
+        assert "/Font" not in form.Resources  # form shows no text
+
+    def test_used_names_are_still_inherited(self):
+        pdf = new_pdf()
+        form = _resourceless_form(pdf, b"/CS0 cs 0 0 m 1 1 l S")
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.Resources = Dictionary(
+            ColorSpace=Dictionary(CS0=Name.DeviceRGB, CS1=Name.DeviceGray),
+            XObject=Dictionary(X=form),
+            Font=Dictionary(F1=Dictionary(Type=Name.Font, Subtype=Name.Type1)),
+        )
+        page.Contents = pdf.make_stream(b"/X Do")
+
+        sanitize_rendering_intent(pdf)
+
+        resources = pdf.pages[0].Resources.XObject.X.Resources
+        assert set(resources.keys()) == {"/ColorSpace"}
+        assert set(resources.ColorSpace.keys()) == {"/CS0"}

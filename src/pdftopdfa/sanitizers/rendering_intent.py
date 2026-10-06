@@ -22,6 +22,7 @@ from ..exceptions import ConversionError
 from ..fonts.glyph_usage import (
     find_ambiguous_resource_context_streams,
     stream_uses_named_resources,
+    used_resource_names,
 )
 from ..utils import iter_type3_fonts, log_suppressed_error
 from ..utils import resolve_indirect as _resolve_indirect
@@ -563,15 +564,51 @@ def _merge_resource_dictionaries(
     return merged
 
 
+def _select_used_resources(
+    parent: Dictionary,
+    used: dict[str, set[str]],
+    excluded_keys: frozenset[str],
+) -> Dictionary:
+    """Copy only the parent resource entries that ``used`` names."""
+    selected = Dictionary()
+    for category, names in used.items():
+        if category in excluded_keys:
+            continue
+        entries = _resolve_indirect(parent.get(category))
+        if not isinstance(entries, Dictionary):
+            continue
+        picked = Dictionary()
+        for name in sorted(names):
+            if name in entries:
+                picked[name] = entries[name]
+        if len(picked):
+            selected[category] = picked
+    return selected
+
+
 def _ensure_associated_resources(
     owner: Dictionary | Stream,
     parent_resources,
     excluded_keys: frozenset[str] = frozenset(),
+    content: list[Stream] | None = None,
 ) -> tuple[Dictionary | None, int, int]:
-    """Ensure owner has explicit /Resources and merge inherited entries."""
+    """Ensure owner has explicit /Resources and merge inherited entries.
+
+    ``content`` lists the owner's content streams (the stream itself, or a
+    Type3 font's CharProcs). When it can be scanned, only the resource names
+    it actually uses are inherited. Copying the whole parent dictionary can
+    make a resource contain itself (a Type3 font inheriting the page's
+    /XObject, whose Form in turn inherited the page's /Font), which viewers
+    such as Acrobat reject.
+    """
     parent_resources = _resolve_indirect(parent_resources)
     if not isinstance(parent_resources, Dictionary):
         parent_resources = None
+    if content is None and isinstance(owner, Stream):
+        content = [owner]
+    used = used_resource_names(content) if content is not None else None
+    if used is not None and parent_resources is not None:
+        parent_resources = _select_used_resources(parent_resources, used, excluded_keys)
 
     resources = owner.get("/Resources")
     resources = _resolve_indirect(resources) if resources is not None else None
@@ -890,10 +927,17 @@ def _ensure_explicit_resources_in_resource_graph(
         for _font_name, font in iter_type3_fonts(parent, visited_fonts):
             if not _visit_once(font, processed_owners):
                 continue
+            charprocs = _resolve_indirect(font.get("/CharProcs"))
+            glyphs = (
+                [proc for _n, proc in charprocs.items() if isinstance(proc, Stream)]
+                if isinstance(charprocs, Dictionary)
+                else []
+            )
             font_resources, added, merged = _ensure_associated_resources(
                 font,
                 parent,
                 excluded_keys=frozenset({"/Font"}),
+                content=glyphs,
             )
             resources_added += added
             resources_merged += merged
