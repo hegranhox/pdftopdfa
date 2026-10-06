@@ -494,11 +494,20 @@ def _iter_resource_graph(
                 if skip_inherited and proc_kind == "istream":
                     charprocs = None  # glyphs reuse these resources
                 if isinstance(charprocs, pikepdf.Dictionary):
-                    discovered.extend(
-                        (proc_kind, proc, t3_resources, t3_key)
+                    # All CharProcs use the same t3_resources object. With the
+                    # font's own /Resources, the first glyph introduces it and
+                    # the others reuse it ("istream"), so resource-only passes
+                    # examine it once rather than once per glyph.
+                    procs = [
+                        proc
                         for _proc_name, proc in charprocs.items()
                         if isinstance(proc, pikepdf.Stream)
-                    )
+                    ]
+                    for index, proc in enumerate(procs):
+                        kind_here = proc_kind if index == 0 else "istream"
+                        if skip_inherited and kind_here == "istream":
+                            break
+                        discovered.append((kind_here, proc, t3_resources, t3_key))
                 if t3_key != key:
                     discovered.append(("resources", t3_resources, None, t3_key))
             except Exception:
@@ -572,20 +581,25 @@ class FontUsageCache:
         """
         self._pdf = pdf
         self._usage: dict[bool, dict[_ObjectKey, set[CharacterCode]]] = {}
+        self._raw: _RawFontUsage | None = None
 
     def get(
         self, *, require_resolved_font: bool = False
     ) -> dict[_ObjectKey, set[CharacterCode]]:
         """Returns the requested usage map, collecting it on first access."""
         if require_resolved_font not in self._usage:
-            self._usage[require_resolved_font] = collect_font_usage(
-                self._pdf, require_resolved_font=require_resolved_font
+            # Both variants come from the same walk; collect it only once.
+            if self._raw is None:
+                self._raw = _collect_raw_font_usage(self._pdf)
+            self._usage[require_resolved_font] = _merge_font_usage(
+                self._raw, require_resolved_font
             )
         return self._usage[require_resolved_font]
 
     def invalidate(self) -> None:
         """Drops the cached usage map after content streams changed."""
         self._usage.clear()
+        self._raw = None
 
 
 def collect_font_usage(
@@ -609,30 +623,67 @@ def collect_font_usage(
         Dictionary mapping indirect font objgens, or serialized direct Type0
         font identities, to the character codes used with each font.
     """
-    usage: dict[_ObjectKey, set[CharacterCode]] = {}
-    unresolved_usage: dict[_ObjectKey, set[CharacterCode]] = {}
-    # Shared streams (Type3 glyphs, reused forms) are reached once per page;
-    # parse each one only once per collection.
-    parse_cache: dict[_ObjectKey, list] = {}
+    return _merge_font_usage(_collect_raw_font_usage(pdf), require_resolved_font)
 
-    for page in pdf.pages:
-        # A nested stream can inherit a font even with its own empty Resources.
-        # Keep its unresolved text in every possible calling font on this page.
-        page_fonts = tuple(font for _name, font in iter_all_page_fonts(page))
-        for stream_owner, resources in _iter_content_streams_with_resources(page):
-            _process_content_stream(
-                stream_owner,
-                resources,
-                usage,
-                page_fonts,
-                unresolved_usage,
-                parse_cache,
-            )
 
+_RawFontUsage = tuple[
+    dict[_ObjectKey, set[CharacterCode]], dict[_ObjectKey, set[CharacterCode]]
+]
+
+
+def _merge_font_usage(
+    raw: _RawFontUsage, require_resolved_font: bool
+) -> dict[_ObjectKey, set[CharacterCode]]:
+    """Combine resolved and unresolved usage into one fresh usage map."""
+    usage_raw, unresolved_usage = raw
+    usage = {key: set(codes) for key, codes in usage_raw.items()}
     for font_key, codes in unresolved_usage.items():
-        if not require_resolved_font or font_key in usage:
+        if not require_resolved_font or font_key in usage_raw:
             usage.setdefault(font_key, set()).update(codes)
     return usage
+
+
+def _collect_raw_font_usage(pdf: pikepdf.Pdf) -> _RawFontUsage:
+    """Collect (resolved, unresolved) font usage for the whole document.
+
+    Resolved usage depends only on each (stream, resources) context, so a
+    document-wide walk that visits every context once gives the same result
+    as walking every page. Unresolved text (shown before any font is set)
+    is attributed to the fonts of each calling page instead; if any occurs,
+    the collection is repeated page by page so every page's fonts get it.
+    """
+    parse_cache: dict[_ObjectKey, list] = {}
+    for document_wide in (True, False):
+        usage: dict[_ObjectKey, set[CharacterCode]] = {}
+        unresolved_usage: dict[_ObjectKey, set[CharacterCode]] = {}
+        saw_unresolved: list[bool] = []
+        walked: set[_ContextKey] | None = set() if document_wide else None
+        for page in pdf.pages:
+            # A nested stream can inherit a font even with its own empty
+            # Resources. Keep its unresolved text in every possible calling
+            # font on this page.
+            # (Only the page-by-page pass needs them; the first pass only
+            # detects unresolved text.)
+            page_fonts = (
+                ()
+                if document_wide
+                else tuple(font for _name, font in iter_all_page_fonts(page))
+            )
+            for stream_owner, resources in _iter_content_streams_with_resources(
+                page, walked
+            ):
+                _process_content_stream(
+                    stream_owner,
+                    resources,
+                    usage,
+                    page_fonts,
+                    unresolved_usage,
+                    parse_cache,
+                    saw_unresolved,
+                )
+        if not saw_unresolved:
+            break
+    return usage, unresolved_usage
 
 
 def _process_content_stream(
@@ -642,6 +693,7 @@ def _process_content_stream(
     page_fonts: tuple[pikepdf.Object, ...],
     unresolved_usage: dict[_ObjectKey, set[CharacterCode]],
     parse_cache: dict[_ObjectKey, list] | None = None,
+    saw_unresolved: list[bool] | None = None,
 ) -> None:
     """Parses a content stream and records character code usage.
 
@@ -719,6 +771,8 @@ def _process_content_stream(
         operator: pikepdf.Operator,
     ) -> None:
         """Conservatively preserve shown codes for every effective font."""
+        if saw_unresolved is not None:
+            saw_unresolved.append(True)
         strings = list(text_operands(operands, operator))
         for font_obj in page_fonts:
             try:

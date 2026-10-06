@@ -1044,3 +1044,49 @@ def test_resources_only_walk_skips_streams_reusing_parent_resources():
         if isinstance(o, pikepdf.Stream)
     ]
     assert glyph.objgen in full and glyph.objgen not in lean
+
+
+def test_unresolved_text_in_shared_form_reaches_every_calling_pages_fonts():
+    """The document-wide walk falls back to per-page for unresolved text."""
+    pdf = new_pdf()
+    form = pdf.make_stream(b"BT (ab) Tj ET")  # no Tf: font comes from caller
+    form[Name.Type] = Name.XObject
+    form[Name.Subtype] = Name.Form
+    form[Name.BBox] = Array([0, 0, 1, 1])
+    fonts = []
+    for base in (Name.Helvetica, Name.Courier):
+        font = pdf.make_indirect(
+            Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=base)
+        )
+        fonts.append(font)
+        page = pdf.add_blank_page(page_size=(10, 10))
+        page.Resources = Dictionary(
+            Font=Dictionary(F1=font), XObject=Dictionary(Fm=form)
+        )
+
+    usage = collect_font_usage(pdf)
+
+    for font in fonts:
+        assert {ord("a"), ord("b")} <= usage[font.objgen]
+
+
+def test_font_usage_cache_walks_once_for_both_variants(monkeypatch):
+    from pdftopdfa.fonts import glyph_usage
+
+    pdf = new_pdf()
+    pdf.add_blank_page(page_size=(10, 10))
+    calls = []
+    original = glyph_usage._collect_raw_font_usage
+
+    def counting(target):
+        calls.append(1)
+        return original(target)
+
+    monkeypatch.setattr(glyph_usage, "_collect_raw_font_usage", counting)
+    cache = FontUsageCache(pdf)
+    cache.get()
+    cache.get(require_resolved_font=True)
+    assert len(calls) == 1
+    cache.invalidate()
+    cache.get()
+    assert len(calls) == 2

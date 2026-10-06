@@ -18,6 +18,7 @@ import hashlib
 import logging
 import re
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -662,6 +663,20 @@ def _content_bbox(owner: Dictionary | Stream) -> Array | None:
     return None
 
 
+# Digests of content streams already found to need no change. Whether a
+# stream needs changing depends only on its bytes (a stream that needs no
+# q/Q rewrap never uses resources or bbox), so identical bytes - the same
+# stream in the late second pass, or duplicate glyphs - can be skipped.
+_CLEAN_CONTENT_DIGESTS: OrderedDict[bytes, None] = OrderedDict()
+_CLEAN_CONTENT_DIGESTS_MAX = 200_000
+
+
+def _remember_clean_content(digest: bytes) -> None:
+    _CLEAN_CONTENT_DIGESTS[digest] = None
+    if len(_CLEAN_CONTENT_DIGESTS) > _CLEAN_CONTENT_DIGESTS_MAX:
+        _CLEAN_CONTENT_DIGESTS.popitem(last=False)
+
+
 def _sanitize_content_stream(
     pdf: Pdf,
     stream_obj: Stream,
@@ -676,6 +691,11 @@ def _sanitize_content_stream(
         log_suppressed_error(
             logger, e, "Skipping unreadable content stream %s: %s", stream_obj.objgen, e
         )
+        return
+
+    digest = hashlib.blake2b(raw, digest_size=16).digest()
+    if digest in _CLEAN_CONTENT_DIGESTS:
+        _CLEAN_CONTENT_DIGESTS.move_to_end(digest)
         return
 
     try:
@@ -757,6 +777,8 @@ def _sanitize_content_stream(
 
     if changed or odd_hex > 0 or invalid_hex > 0:
         stream_obj.write(pikepdf.unparse_content_stream(rewritten))
+    elif instructions or not raw.strip():
+        _remember_clean_content(digest)
 
 
 def _iter_owner_streams(owner: Any) -> list[Stream]:
