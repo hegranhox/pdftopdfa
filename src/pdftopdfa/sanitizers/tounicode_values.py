@@ -325,7 +325,7 @@ def _iter_fonts_from_effective_resources(
             resources,
             _key,
             inherited,
-        ) in iter_content_streams_with_resource_info(page):
+        ) in iter_content_streams_with_resource_info(page, resources_only=True):
             if inherited:  # same resources object, fonts already yielded
                 continue
             resources = _resolve(resources)

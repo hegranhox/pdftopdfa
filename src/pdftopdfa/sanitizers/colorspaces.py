@@ -550,7 +550,7 @@ def validate_embedded_icc_profiles(
                 nested_resources,
                 _key,
                 inherited,
-            ) in iter_content_streams_with_resource_info(page):
+            ) in iter_content_streams_with_resource_info(page, resources_only=True):
                 if inherited:  # same resources object as already validated
                     continue
                 owner = _resolve_indirect(owner)
@@ -1126,7 +1126,7 @@ def sanitize_special_colorspace_consistency(pdf: Pdf) -> tuple[int, int]:
                 nested_resources,
                 _key,
                 inherited,
-            ) in iter_content_streams_with_resource_info(page):
+            ) in iter_content_streams_with_resource_info(page, resources_only=True):
                 if inherited:
                     continue
                 a, b = _sanitize_special_colorspaces_in_resources(

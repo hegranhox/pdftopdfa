@@ -125,6 +125,8 @@ def iter_content_streams_with_resource_keys(
 def iter_content_streams_with_resource_info(
     page: pikepdf.Page,
     processed: set[_ContextKey] | None = None,
+    *,
+    resources_only: bool = False,
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object, _ObjectKey, bool]]:
     """Yields (content_stream_owner, resources) for all nested structures on a page.
 
@@ -147,6 +149,9 @@ def iter_content_streams_with_resource_info(
         very resources object already yielded for its parent (resourceless
         forms, CharProcs of a Type3 font without /Resources), so callers that
         only act on resources can skip it, even ones that modify them.
+        With ``resources_only=True`` such owners are not visited at all
+        (their resources are the parent's, and their children are queued
+        from the parent already), which saves walking every shared glyph.
     """
     if processed is None:
         processed = set()
@@ -158,7 +163,9 @@ def iter_content_streams_with_resource_info(
         resources_key = _object_identity(_resolve_indirect(resources))
         yield (page.obj, resources, resources_key, False)
         yield from _iter_resource_graph(
-            [("resources", resources, None, resources_key)], processed
+            [("resources", resources, None, resources_key)],
+            processed,
+            skip_inherited=resources_only,
         )
 
     # Annotation Appearance Streams
@@ -200,6 +207,7 @@ def iter_content_streams_with_resource_info(
                             ap_entry,
                             res,
                             processed,
+                            skip_inherited=resources_only,
                         )
                 elif isinstance(ap_entry, pikepdf.Dictionary):
                     for sub_key in list(ap_entry.keys()):
@@ -216,6 +224,7 @@ def iter_content_streams_with_resource_info(
                                         sub,
                                         res,
                                         processed,
+                                        skip_inherited=resources_only,
                                     )
                         except Exception:
                             continue
@@ -345,11 +354,14 @@ def _iter_stream_context(
     stream: pikepdf.Stream,
     resources: pikepdf.Dictionary,
     processed: set[_ContextKey],
+    *,
+    skip_inherited: bool = False,
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object, _ObjectKey, bool]]:
     """Yield one stream/resource context and its graph without recursion."""
     yield from _iter_resource_graph(
         [("stream", stream, resources, None)],
         processed,
+        skip_inherited=skip_inherited,
     )
 
 
@@ -369,6 +381,8 @@ def _iter_resource_graph(
         tuple[str, pikepdf.Object, pikepdf.Object | None, _ObjectKey | None]
     ],
     processed: set[_ContextKey],
+    *,
+    skip_inherited: bool = False,
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Object, _ObjectKey, bool]]:
     """Walk content-bearing resource graphs with an explicit work stack.
 
@@ -477,6 +491,8 @@ def _iter_resource_graph(
                     continue
                 processed.add(font_context)
                 charprocs = _resolve_indirect(font.get("/CharProcs"))
+                if skip_inherited and proc_kind == "istream":
+                    charprocs = None  # glyphs reuse these resources
                 if isinstance(charprocs, pikepdf.Dictionary):
                     discovered.extend(
                         (proc_kind, proc, t3_resources, t3_key)
@@ -488,6 +504,8 @@ def _iter_resource_graph(
             except Exception:
                 continue
 
+        if skip_inherited:
+            discovered = [task for task in discovered if task[0] != "istream"]
         tasks.extend(reversed(discovered))
 
 

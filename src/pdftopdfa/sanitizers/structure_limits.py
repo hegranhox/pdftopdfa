@@ -1128,10 +1128,20 @@ def _ensure_no_cid_overflow(
     usage_cache: FontUsageCache | None = None,
 ) -> int:
     """Repair CMap CID overflows and raise on unparseable remaining ones."""
-    if usage_cache is not None:
-        font_usage = usage_cache.get()
-    else:
-        font_usage = collect_font_usage(pdf)
+    # Font usage is expensive (it parses every content stream) and only
+    # needed for CMaps that actually overflow, which is rare: collect lazily.
+    font_usage: dict | None = None
+
+    def get_font_usage() -> dict:
+        nonlocal font_usage
+        if font_usage is None:
+            font_usage = (
+                usage_cache.get()
+                if usage_cache is not None
+                else collect_font_usage(pdf)
+            )
+        return font_usage
+
     seen_fonts: set[tuple[int, int]] = set()
     repaired = 0
     for page in pdf.pages:
@@ -1152,9 +1162,11 @@ def _ensure_no_cid_overflow(
             encoding = _resolve(font.get("/Encoding"))
             if not isinstance(encoding, Stream):
                 continue
+            if not _cmap_has_cid_overflow(encoding):
+                continue  # nothing to repair, nothing to raise
 
             repaired_here, remaining_overflow = _repair_cid_overflow_entries(
-                encoding, font_usage.get(objgen, set())
+                encoding, get_font_usage().get(objgen, set())
             )
             repaired += repaired_here
             if repaired_here > 0:

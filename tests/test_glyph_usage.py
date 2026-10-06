@@ -1014,3 +1014,33 @@ def test_resource_info_flags_owners_that_reuse_parent_resources():
     }
 
     assert flags == {plain.objgen: True, own.objgen: False, glyph.objgen: True}
+
+
+def test_resources_only_walk_skips_streams_reusing_parent_resources():
+    from pdftopdfa.fonts.glyph_usage import iter_content_streams_with_resource_info
+
+    pdf = new_pdf()
+    glyph = pdf.make_stream(b"0 0 d0")
+    font = pdf.make_indirect(
+        Dictionary(
+            Type=Name.Font,
+            Subtype=Name.Type3,
+            CharProcs=Dictionary(a=glyph),
+            FontBBox=Array([0, 0, 1, 1]),
+            FontMatrix=Array([1, 0, 0, 1, 0, 0]),
+        )
+    )
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = Dictionary(Font=Dictionary(T=font))
+
+    full = [
+        o.objgen
+        for o, *_ in iter_content_streams_with_resource_info(page)
+        if isinstance(o, pikepdf.Stream)
+    ]
+    lean = [
+        o.objgen
+        for o, *_ in iter_content_streams_with_resource_info(page, resources_only=True)
+        if isinstance(o, pikepdf.Stream)
+    ]
+    assert glyph.objgen in full and glyph.objgen not in lean

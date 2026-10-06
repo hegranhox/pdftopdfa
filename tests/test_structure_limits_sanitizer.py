@@ -708,3 +708,25 @@ endcidrange
             operand = Array([operand])
 
         assert _operands_contain_parse_placeholders(operand) is True
+
+
+def test_cid_overflow_check_skips_font_usage_without_overflowing_cmap(monkeypatch):
+    """Font usage (a full content parse) is collected only when needed."""
+    import pdftopdfa.sanitizers.structure_limits as structure_limits
+
+    pdf = new_pdf()
+    cmap = pdf.make_stream(
+        b"1 begincidchar\n<0001> 5\nendcidchar\n1 begincidrange\n"
+        b"<0000> <00ff> 10\nendcidrange\n"
+    )
+    font = pdf.make_indirect(
+        Dictionary(Type=Name.Font, Subtype=Name.Type0, BaseFont=Name.X, Encoding=cmap)
+    )
+    page = pdf.add_blank_page(page_size=(10, 10))
+    page.Resources = Dictionary(Font=Dictionary(F1=font))
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("font usage collected without CID overflow")
+
+    monkeypatch.setattr(structure_limits, "collect_font_usage", fail)
+    assert structure_limits._ensure_no_cid_overflow(pdf) == 0

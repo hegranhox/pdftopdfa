@@ -612,6 +612,7 @@ def _fix_transparency_group_colorspaces(
     """
     fixed = 0
     visited: set[tuple[int, int]] = set()
+    walked: set = set()  # each Form is fixed in place once: walk once
 
     for page in pdf.pages:
         # Fix page-level transparency group /CS (ISO 32000-1, Table 30)
@@ -626,7 +627,7 @@ def _fix_transparency_group_colorspaces(
                     xobjects, pdf, icc_stream_cache, visited
                 )
 
-        for owner, _resources in _iter_content_streams_with_resources(page):
+        for owner, _resources in _iter_content_streams_with_resources(page, walked):
             owner = _resolve_indirect(owner)
             if isinstance(owner, Stream) and owner.get(Name.Subtype) == Name.Form:
                 fixed += _fix_transparency_group_cs_in_form(
